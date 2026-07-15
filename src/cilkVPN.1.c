@@ -150,9 +150,9 @@ int main(int argc, char **argv) {
 #endif
 
     for (;;) {
-        unsigned char buffer[1500];
+        unsigned char buffer[1400];
         
-        int nread  = read(iface, buffer, 1500);
+        int nread  = read(iface, buffer, 1400);
 		
 		printf("Len: %d\n", nread);
 		
