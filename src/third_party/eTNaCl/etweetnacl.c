@@ -46,6 +46,12 @@ void randombytes(u8* buf,u64 len) {
 	arc4random_buf(buf, len);
 }
 
+uint32_t generate_random_uint32(void) {
+    uint32_t random_value = 0;
+    arc4random_buf(&random_value, sizeof(uint32_t));
+    return random_value;
+}
+
 int crypto_sign_ed25519_pk_to_curve25519(u8 *z, u8 *ed25519pk) {
     gf q[4];
     gf a, b;
