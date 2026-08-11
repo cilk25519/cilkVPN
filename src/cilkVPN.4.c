@@ -42,7 +42,7 @@ Address = 10.0.0.2/24
 PublicKey = eb119f5604eac33290f6d8a0dc0e52d82f17914995c4acc7a8211b2235a71fb1
 Endpoint = 154.44.3.12:3342
 AllowedIPs = 10.0.0.0/24
-PersistentHANDSHAKE = 25
+PersistentKeepalive = 25
 =================================
 
 Peer 3:
@@ -61,7 +61,7 @@ Address = 10.0.0.3/24
 PublicKey = eb119f5604eac33290f6d8a0dc0e52d82f17914995c4acc7a8211b2235a71fb1
 Endpoint = 154.44.3.12:3342
 AllowedIPs = 10.0.0.0/24
-PersistentHANDSHAKE = 25
+PersistentKeepalive = 25
 =================================
 */
 
@@ -98,7 +98,7 @@ PersistentHANDSHAKE = 25
 #define CILK_VPN_HANDSHAKE_SIG (crypto_box_ZEROBYTES + crypto_sign_BYTES + CILK_VPN_HANDSHAKE_TO_SIGN)
 #define CILK_VPN_HANDSHAKE (CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES + crypto_box_PUBLICKEYBYTES + crypto_onetimeauth_BYTES + crypto_sign_BYTES + CILK_VPN_HANDSHAKE_TO_SIGN)
 #define CILK_VPN_DATAGRAM (CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES + CILK_VPN_PEER_INDEX + crypto_onetimeauth_BYTES)
-#define CILK_VPN_PERSISTENT_HANDSHAKE_SECONDS_DEFAULT 20
+#define CILK_VPN_PERSISTENT_KEEPALIVE_SECONDS_DEFAULT 20
 #define CILK_VPN_INBOUND_UDP_BUFFER_SIZE 65535
 #define CILK_VPN_MAX_ALLOWED_IPS 256
 
@@ -108,8 +108,6 @@ PersistentHANDSHAKE = 25
 #define MAX_CONF_LINE_LENGTH 512
 #define MAX_CONF_KEY_LENGTH 64
 #define MAX_CONF_VALUE_LENGTH 256
-
-#define PRINT_HEX_2_LINUX_NATIVE(s_2_print, len_s_2_print) for (int i=0; i < len_s_2_print; i++) { printf("\\x%02x", s_2_print[i]); } printf("\n"); 
 
 #define CILK_VPN_TUN_BUFFER_SIZE (crypto_box_ZEROBYTES + 65535 - CILK_VPN_DATAGRAM)
 #define CILK_VPN_TUN_ENCRYPTED_BUFFER (CILK_VPN_DATAGRAM + 65535)
@@ -160,7 +158,7 @@ typedef struct ip_address_t {
 typedef struct peer_t {
     unsigned char ed25519_identity_public_key[crypto_sign_PUBLICKEYBYTES];
     unsigned char x25519_identity_public_key[crypto_box_PUBLICKEYBYTES];
-    int persistent_HANDSHAKE;
+    int persistent_keepalive;
     struct sockaddr_in local_addr;
     struct sockaddr_in endpoint_addr;
     int has_endpoint;
@@ -191,12 +189,12 @@ typedef struct device_t {
     
     unsigned char outbound_handshake_to_sign[CILK_VPN_HANDSHAKE_TO_SIGN];    
     unsigned char outbound_handshake_sig[CILK_VPN_HANDSHAKE_SIG];
-    unsigned char outbound_HANDSHAKE[CILK_VPN_HANDSHAKE];
+    unsigned char outbound_handshake[CILK_VPN_HANDSHAKE];
     
     int inbound_recv_bytes;
-    unsigned char inbound_encrypted_datagram[CILK_VPN_INBOUND_UDP_BUFFER_SIZE];
-    unsigned char inbound_decrypted_datagram[CILK_VPN_INBOUND_UDP_BUFFER_SIZE];
-    unsigned char inbound_symmetric_key[crypto_box_BEFORENMBYTES];
+    unsigned char inbound_encrypted[CILK_VPN_INBOUND_UDP_BUFFER_SIZE];
+    unsigned char inbound_decrypted[CILK_VPN_INBOUND_UDP_BUFFER_SIZE];
+    unsigned char inbound_handshake_symmetric_key[crypto_box_BEFORENMBYTES];
     unsigned char inbound_handshake_to_sign[CILK_VPN_HANDSHAKE_TO_SIGN];
     
     int outbound_read_bytes;
@@ -316,17 +314,7 @@ void print_iface_datagram(char* label, unsigned char* buffer, int buffer_size) {
     char ip_dst_str[INET_ADDRSTRLEN];
     ip_to_string(ip_dst, ip_dst_str, sizeof(ip_dst_str));
 	
-	printf("%s", label);
-    
-    printf("Src: %s, Dest: %s, Len: %d\n", ip_src_str, ip_dst_str, buffer_size);
-    for (int i = 0; i< buffer_size; i++) {
-        printf("%02x ", buffer[i]);
-    
-        if ( i%16 == 15 ) {
-            printf("\n");
-        }
-    }
-    printf("\n");
+    printf("%s Src: %s, Dest: %s, Len: %d\n", label, ip_src_str, ip_dst_str, buffer_size);
 }
 
 void print_peers(const device* d) {
@@ -342,7 +330,7 @@ void print_peers(const device* d) {
         printf("│\n");
         printf("│ Endpoint: %s:%d\n", inet_ntoa(p->endpoint_addr.sin_addr), ntohs(p->endpoint_addr.sin_port));
         printf("│ Local IP: %s\n", inet_ntoa(p->local_addr.sin_addr));
-        printf("│ HANDSHAKE: %d seconds \n", p->persistent_HANDSHAKE);
+        printf("│ HANDSHAKE: %d seconds \n", p->persistent_keepalive);
         printf("│\n");
         
         if (p->allowed_ips_count > 0) {
@@ -358,11 +346,6 @@ void print_peers(const device* d) {
         } else {
             printf("│ Allowed IPs: (none)\n");
         }
-        
-        PRINT_HEX_WITH_LABLE("│ Inbound symetric key", p->inbound_symmetric_key, crypto_box_BEFORENMBYTES);
-        PRINT_HEX_WITH_LABLE("│ Outbound symetric key", p->outbound_symmetric_key, crypto_box_BEFORENMBYTES);
-        printf("│ Inbound peer index: %u\n", p->inbound_peer_index);
-        printf("│ Outbund peer index: %u\n", p->outbound_peer_index);
         
         printf("└───────────────────────────────────────────────────────────────────\n");
         
@@ -680,7 +663,7 @@ int init_device_from_file(device* d, FILE* f) {
             
             peer* p = malloc(sizeof(peer));
             memset(p, 0, sizeof(peer));
-            p->persistent_HANDSHAKE = CILK_VPN_PERSISTENT_HANDSHAKE_SECONDS_DEFAULT;
+            p->persistent_keepalive = CILK_VPN_PERSISTENT_KEEPALIVE_SECONDS_DEFAULT;
             
             if (last_peer == NULL) {
                 d->peers = last_peer = p;
@@ -741,11 +724,11 @@ int init_device_from_file(device* d, FILE* f) {
                 }
             }
             
-            if (strcmp(key, "PersistentHANDSHAKE") == 0) {
-                last_peer->persistent_HANDSHAKE = atoi(value);
+            if (strcmp(key, "PersistentKeepalive") == 0) {
+                last_peer->persistent_keepalive = atoi(value);
                 
-                if (last_peer->persistent_HANDSHAKE <= 0) {
-                    last_peer->persistent_HANDSHAKE = CILK_VPN_PERSISTENT_HANDSHAKE_SECONDS_DEFAULT;
+                if (last_peer->persistent_keepalive <= 0) {
+                    last_peer->persistent_keepalive = CILK_VPN_PERSISTENT_KEEPALIVE_SECONDS_DEFAULT;
                 }
             }
         }
@@ -833,35 +816,35 @@ int send_handshake_2_peer(device* d, peer* p) {
     crypto_box_keypair(d->x25519_ephemeral_keypair.public_key, d->x25519_ephemeral_keypair.secret_key); //gen ephemeral keypair
     crypto_box_beforenm(p->outbound_symmetric_key, p->x25519_identity_public_key, d->x25519_ephemeral_keypair.secret_key); //dh    
     
-    memset(d->outbound_HANDSHAKE, 0, CILK_VPN_HANDSHAKE);
-    d->outbound_HANDSHAKE[0] = HANDSHAKE;
+    memset(d->outbound_handshake, 0, CILK_VPN_HANDSHAKE);
+    d->outbound_handshake[0] = HANDSHAKE;
     
-    unsigned char* outbound_handshake_nonce = d->outbound_HANDSHAKE + CILK_VPN_TYPE_DATAGRAM;
+    unsigned char* outbound_handshake_nonce = d->outbound_handshake + CILK_VPN_TYPE_DATAGRAM;
     randombytes(outbound_handshake_nonce, crypto_box_NONCEBYTES); //gen nonce
     
-    unsigned char* box = d->outbound_HANDSHAKE + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES + crypto_box_BOXZEROBYTES; //skip 1 byte of transport header + 24 bytes of nonce + 16 zerobytes
+    unsigned char* box = d->outbound_handshake + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES + crypto_box_BOXZEROBYTES; //skip 1 byte of transport header + 24 bytes of nonce + 16 zerobytes
     crypto_box_afternm(box, d->outbound_handshake_sig, CILK_VPN_HANDSHAKE_SIG, outbound_handshake_nonce, p->outbound_symmetric_key); //encrypt
     
-    memcpy(d->outbound_HANDSHAKE + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES, d->x25519_ephemeral_keypair.public_key, crypto_box_PUBLICKEYBYTES); //replace 32 zero bytes on ephemeral public key
+    memcpy(d->outbound_handshake + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES, d->x25519_ephemeral_keypair.public_key, crypto_box_PUBLICKEYBYTES); //replace 32 zero bytes on ephemeral public key
     
-    return sendto(d->udp, d->outbound_HANDSHAKE, CILK_VPN_HANDSHAKE, 0, (struct sockaddr *)&p->endpoint_addr, sizeof(p->endpoint_addr));
+    return sendto(d->udp, d->outbound_handshake, CILK_VPN_HANDSHAKE, 0, (struct sockaddr *)&p->endpoint_addr, sizeof(p->endpoint_addr));
 }
 
 void handle_handshake(device* d) {
-    unsigned char* peer_ephemeral_public_key = d->inbound_encrypted_datagram + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES;    
-    crypto_box_beforenm(d->inbound_symmetric_key, peer_ephemeral_public_key, d->x25519_identity_keypair.secret_key); //dh
+    unsigned char* peer_ephemeral_public_key = d->inbound_encrypted + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES;    
+    crypto_box_beforenm(d->inbound_handshake_symmetric_key, peer_ephemeral_public_key, d->x25519_identity_keypair.secret_key); //dh
     
-    unsigned char* nonce = d->inbound_encrypted_datagram + CILK_VPN_TYPE_DATAGRAM;
+    unsigned char* nonce = d->inbound_encrypted + CILK_VPN_TYPE_DATAGRAM;
     int inbound_unboxed_datagram_len = d->inbound_recv_bytes - CILK_VPN_TYPE_DATAGRAM - crypto_box_NONCEBYTES - crypto_box_BOXZEROBYTES;
-    unsigned char* box = d->inbound_encrypted_datagram + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES + crypto_box_BOXZEROBYTES;
+    unsigned char* box = d->inbound_encrypted + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES + crypto_box_BOXZEROBYTES;
     memset(box, 0, crypto_box_BOXZEROBYTES);    
-    memset(d->inbound_decrypted_datagram, 0, CILK_VPN_INBOUND_UDP_BUFFER_SIZE);
-    if (crypto_box_open_afternm(d->inbound_decrypted_datagram, box, inbound_unboxed_datagram_len, nonce, d->inbound_symmetric_key) == -1) { //decrypt
+    memset(d->inbound_decrypted, 0, CILK_VPN_INBOUND_UDP_BUFFER_SIZE);
+    if (crypto_box_open_afternm(d->inbound_decrypted, box, inbound_unboxed_datagram_len, nonce, d->inbound_handshake_symmetric_key) == -1) { //decrypt
         return;
     }
     
     memset(d->inbound_handshake_to_sign, 0, CILK_VPN_HANDSHAKE_TO_SIGN);
-    unsigned char* sig = d->inbound_decrypted_datagram + crypto_box_ZEROBYTES;
+    unsigned char* sig = d->inbound_decrypted + crypto_box_ZEROBYTES;
     unsigned long long sig_len = inbound_unboxed_datagram_len - crypto_box_ZEROBYTES;
     if (crypto_sign_open2(d->inbound_handshake_to_sign, sig, sig_len, sig + crypto_sign_BYTES) != 0) {  //auth (part 1)
         return;
@@ -874,7 +857,7 @@ void handle_handshake(device* d) {
     
     update_peer_endpoint(p, d->inbound_peer_addr);
     
-    memcpy(p->inbound_symmetric_key, d->inbound_symmetric_key, crypto_box_BEFORENMBYTES);
+    memcpy(p->inbound_symmetric_key, d->inbound_handshake_symmetric_key, crypto_box_BEFORENMBYTES);
     
     uint32_t ip_addr;
     memcpy(&ip_addr, d->inbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES, CILK_VPN_HANDSHAKE_TO_SIGN_IP);
@@ -902,7 +885,7 @@ void handle_handshake(device* d) {
 }
 
 int encrypt_and_send_datagram_2_peer(device* d, peer* p) {      
-	print_iface_datagram("Iface > UDP. ", d->outbound_iface_datagram + crypto_box_ZEROBYTES, d->outbound_read_bytes); 
+	print_iface_datagram("Iface > UDP", d->outbound_iface_datagram + crypto_box_ZEROBYTES, d->outbound_read_bytes); 
   
     randombytes(d->nonce, crypto_box_NONCEBYTES);
     memset(d->outbound_iface_datagram, 0, crypto_box_ZEROBYTES);
@@ -918,52 +901,52 @@ int encrypt_and_send_datagram_2_peer(device* d, peer* p) {
 
 void handle_datagram(device* d) {
     uint32_t peer_index;
-    memcpy(&peer_index, d->inbound_encrypted_datagram + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES, CILK_VPN_PEER_INDEX);
+    memcpy(&peer_index, d->inbound_encrypted + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES, CILK_VPN_PEER_INDEX);
     
     peer* p = find_peer_by_inbound_peer_index(d->peers, peer_index);
     if (p == NULL) {
         return;
     }
     
-    memcpy(d->nonce, d->inbound_encrypted_datagram + CILK_VPN_TYPE_DATAGRAM, crypto_box_NONCEBYTES);
+    memcpy(d->nonce, d->inbound_encrypted + CILK_VPN_TYPE_DATAGRAM, crypto_box_NONCEBYTES);
     
     int inbound_unboxed_datagram_len = d->inbound_recv_bytes - CILK_VPN_OFFSET_TO_CRYPTOGRAPHY;
-    unsigned char* box = d->inbound_encrypted_datagram + CILK_VPN_OFFSET_TO_CRYPTOGRAPHY;
+    unsigned char* box = d->inbound_encrypted + CILK_VPN_OFFSET_TO_CRYPTOGRAPHY;
     memset(box, 0, crypto_box_BOXZEROBYTES);
     
-    memset(d->inbound_decrypted_datagram, 0, CILK_VPN_INBOUND_UDP_BUFFER_SIZE);
+    memset(d->inbound_decrypted, 0, CILK_VPN_INBOUND_UDP_BUFFER_SIZE);
     
-    if (crypto_box_open_afternm(d->inbound_decrypted_datagram, box, inbound_unboxed_datagram_len, d->nonce, p->inbound_symmetric_key) == -1) { //decrypt 
+    if (crypto_box_open_afternm(d->inbound_decrypted, box, inbound_unboxed_datagram_len, d->nonce, p->inbound_symmetric_key) == -1) { //decrypt 
         return;
     }
     
-    uint32_t ip_src = *(uint32_t *)(d->inbound_decrypted_datagram + crypto_box_ZEROBYTES + CILK_VPN_IP_IFACE_OFFSET + 12);
+    uint32_t ip_src = *(uint32_t *)(d->inbound_decrypted + crypto_box_ZEROBYTES + CILK_VPN_IP_IFACE_OFFSET + 12);
     if (is_allowed_ips(p, ip_src) == -1) {
         return;
     }
     
     update_peer_endpoint(p, d->inbound_peer_addr);
 	
-	MARK_IP_DATAGRAM_AS_IP_V4( d->inbound_decrypted_datagram );
+	MARK_IP_DATAGRAM_AS_IP_V4( d->inbound_decrypted );
 
-    print_iface_datagram("UDP > Iface. ", d->inbound_decrypted_datagram + crypto_box_ZEROBYTES, inbound_unboxed_datagram_len - crypto_box_ZEROBYTES);    
+    print_iface_datagram("UDP > Iface", d->inbound_decrypted + crypto_box_ZEROBYTES, inbound_unboxed_datagram_len - crypto_box_ZEROBYTES);    
     
-    if (write(d->iface, d->inbound_decrypted_datagram + crypto_box_ZEROBYTES, inbound_unboxed_datagram_len - crypto_box_ZEROBYTES) <= 0) {
+    if (write(d->iface, d->inbound_decrypted + crypto_box_ZEROBYTES, inbound_unboxed_datagram_len - crypto_box_ZEROBYTES) <= 0) {
         //log
     }
 }
 
 void cilkVPN__recv(device* d) {
-    d->inbound_recv_bytes = recvfrom(d->udp, d->inbound_encrypted_datagram, CILK_VPN_INBOUND_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->inbound_peer_addr, &d->inbound_peer_addr_len);
+    d->inbound_recv_bytes = recvfrom(d->udp, d->inbound_encrypted, CILK_VPN_INBOUND_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->inbound_peer_addr, &d->inbound_peer_addr_len);
     if (d->inbound_recv_bytes < 0) {
         return;
     }
 
-    if (d->inbound_encrypted_datagram[0] == HANDSHAKE) {
+    if (d->inbound_encrypted[0] == HANDSHAKE) {
         handle_handshake(d);
-    } else if (d->inbound_encrypted_datagram[0] == DATAGRAM) {
+    } else if (d->inbound_encrypted[0] == DATAGRAM) {
         handle_datagram(d);
-    } else if (d->inbound_encrypted_datagram[0] == KEEPALIVE) {
+    } else if (d->inbound_encrypted[0] == KEEPALIVE) {
         //handle_keepalive(d);
     }
 }
