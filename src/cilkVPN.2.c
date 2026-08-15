@@ -6,6 +6,7 @@ clang ./cilkVPN.2.c -O3 -o ./cilkVPN
 ListenPort = 3342
 PrivateKey = ff4cb24de001f7970abe632ac9eeda89452b71042b71ef8959978a49e534a7e4
 Address = 10.0.0.1/24
+MTU = 1400
 
 [Peer]
 PublicKey = e911c20b180ea9316e93f1e94e88269bdb0290cf24bed6f0fefb939350cfefad
@@ -27,6 +28,7 @@ sudo ./cilkVPN
 ListenPort = 3343
 PrivateKey = 9c5904a620c3ecfb88ff19c03f3d05ef709f66f7f0929fd9d3ddf373333012cf
 Address = 10.0.0.2/24
+MTU = 1400
 
 [Peer]
 PublicKey = eb119f5604eac33290f6d8a0dc0e52d82f17914995c4acc7a8211b2235a71fb1
@@ -46,6 +48,7 @@ sudo ./cilkVPN
 ListenPort = 3342
 PrivateKey = 1ce257003246bc455931281ed68adcc1dff03a12bc1e864d810f6e3d491a8966
 Address = 10.0.0.3/24
+MTU = 1400
 
 [Peer]
 PublicKey = eb119f5604eac33290f6d8a0dc0e52d82f17914995c4acc7a8211b2235a71fb1
@@ -85,6 +88,7 @@ sudo ifconfig utun5 up
 #endif
 #include "./third_party/eTNaCl/etweetnacl.c"
 
+#define CILK_VPN_IFACE_MTU_DEFAULT 1400
 #define CILK_VPN_TRANSPORT_TYPE 1
 #define CILK_VPN_TRANSPORT_HANDSHAKE_BYTE 0x00
 #define CILK_VPN_TRANSPORT_DATAGRAM_BYTE 0x01
@@ -158,7 +162,9 @@ typedef struct device_t {
     struct sockaddr_in peer_addr;
     socklen_t peer_addr_len;
     peer* peers;
+	int base_interface_commands_exec;
     int peers_count;
+	int iface_mtu;
     int iface;
     int udp;
     int el;
@@ -596,6 +602,23 @@ int make_udp(const struct sockaddr* listen_addr, size_t listen_addr_len) {
     return fd;
 }
 
+static void exec(const char *cmd) {
+    fprintf(stderr, "%s\n", cmd);  // выводим команду в stderr (небуферизованный)
+    fflush(stderr); // сбрасываем буфер на всякий случай
+
+    int ret = system(cmd);
+	
+    if (ret == -1) {
+        perror("system");
+        exit(1);
+    }
+	
+    if (WIFEXITED(ret) && WEXITSTATUS(ret) != 0) {
+        fprintf(stderr, "Command failed with exit status %d: %s\n", WEXITSTATUS(ret), cmd);
+        exit(1);
+    }
+}
+
 #if defined(__linux__)
 //https://www.baeldung.com/linux/tun-interface-purpose
 
@@ -639,6 +662,28 @@ int make_epoll(int iface, int udp){
     epoll_ctl(epfd, EPOLL_CTL_ADD, iface, &ev);
     
     return epfd;
+}
+
+void exec_base_iface_linux_commands(device* d) {
+    char ip_str[INET_ADDRSTRLEN];
+    ip_to_string(d->address.ip, ip_str, sizeof(ip_str));
+    int mask = mask_to_cidr(d->address.mask);
+	
+	uint32_t network_addr = d->address.ip & d->address.mask;
+	char network_addr_str[INET_ADDRSTRLEN];
+    ip_to_string(network_addr, network_addr_str, sizeof(network_addr_str));
+	
+//sudo ip route add 10.0.0.0/24 dev cilk0
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "ip addr add %s/%d dev cilk0", ip_str, mask);
+    exec(cmd);
+    snprintf(cmd, sizeof(cmd), "ip link set mtu %d dev cilk0", d->iface_mtu);
+    exec(cmd);
+    snprintf(cmd, sizeof(cmd), "ip link set dev cilk0 up");
+    exec(cmd);
+	snprintf(cmd, sizeof(cmd), "ip route replace %s/%d dev cilk0", network_addr_str, mask);
+    exec(cmd);
 }
 #elif defined(__APPLE__) || defined(__FreeBSD__)
 //https://gist.github.com/ssrlive/0dd4776d7fc656e5bfb807a59e7f82a0
@@ -701,6 +746,26 @@ int make_kqueue(int iface, int udp){
     kevent(kq, evSet, 2, NULL, 0, NULL);
     
     return kq;
+}
+
+void exec_base_iface_freeBSD_commands(device* d, char* utun_name) {
+    char ip_str[INET_ADDRSTRLEN];
+    ip_to_string(d->address.ip, ip_str, sizeof(ip_str));
+    int mask = mask_to_cidr(d->address.mask);
+	
+	uint32_t network_addr = d->address.ip & d->address.mask;
+	char network_addr_str[INET_ADDRSTRLEN];
+    ip_to_string(network_addr, network_addr_str, sizeof(network_addr_str));
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "ifconfig %s inet %s/%d %s alias", utun_name, ip_str, mask, ip_str);
+    exec(cmd);	
+    snprintf(cmd, sizeof(cmd), "ifconfig %s mtu %d", utun_name, d->iface_mtu);
+	exec(cmd);
+    snprintf(cmd, sizeof(cmd), "ifconfig %s up", utun_name);
+	exec(cmd);
+	snprintf(cmd, sizeof(cmd), "route add -net %s/%d -interface %s", network_addr_str, mask, utun_name);
+	exec(cmd);
 }
 #endif
 
@@ -1032,6 +1097,14 @@ int init_device_from_file(device* d, FILE* f) {
                     return -1;
                 }
             }
+			
+            if (strcmp(key, "MTU") == 0) {
+                d->iface_mtu = atoi(value);
+            }
+			
+            if (strcmp(key, "BaseInterfaceCommandsExec") == 0) {
+                d->base_interface_commands_exec = atoi(value);
+            }
         }
         
         if (is_peer_section == 1) {
@@ -1130,7 +1203,11 @@ device* make_device_from_config(const char* config_file) {
     d->listen_addr.sin_port = htons(d->listen_port);
     
     d->peer_addr_len = sizeof(d->peer_addr);
-            
+	
+	if (d->iface_mtu == 0) {
+		d->iface_mtu = CILK_VPN_IFACE_MTU_DEFAULT;
+	}
+	        
     return d;
 }
 
@@ -1146,14 +1223,18 @@ int main(int argc, char **argv) {
     }
 
     d->udp = make_udp((const struct sockaddr *)&d->listen_addr, sizeof(d->listen_addr));
-    
+
 #if defined(__linux__)
     d->iface = tun_open("cilk0");
     if (d->iface == -1) {
         fprintf(stderr, "Unable to establish tun descriptor - aborting\n");
         exit(1);
     }
-    
+	
+	if (d->base_interface_commands_exec == 1) {
+		exec_base_iface_linux_commands(d);
+	}
+	
     d->el = make_epoll(d->iface, d->udp);
 #elif defined(__APPLE__) || defined(__FreeBSD__)
     char name[20] = { 0 };
@@ -1164,6 +1245,10 @@ int main(int argc, char **argv) {
     }
     
     fprintf(stderr, "Utun interface [%s] is up...\n", name);
+	
+	if (d->base_interface_commands_exec == 1) {
+		exec_base_iface_freeBSD_commands(d, name);
+	}
     
     d->el = make_kqueue(d->iface, d->udp);
 #endif
