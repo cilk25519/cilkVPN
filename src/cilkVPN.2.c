@@ -40,7 +40,7 @@ Address = 10.0.0.2/24
 
 [Peer]
 PublicKey = eb119f5604eac33290f6d8a0dc0e52d82f17914995c4acc7a8211b2235a71fb1
-Endpoint = 154.44.3.12:3342
+Endpoint = 193.124.59.51:3342
 AllowedIPs = 10.0.0.0/24
 PersistentKeepalive = 25
 =================================
@@ -48,7 +48,7 @@ PersistentKeepalive = 25
 Peer 3:
 sudo ./cilkVPN
 sudo ifconfig utun5 inet 10.0.0.3/32 10.0.0.3 alias
-sudo ip route add 10.0.0.0/24 dev utun5
+sudo route add -net 10.0.0.0/24 -interface utun5
 sudo ifconfig utun5 up
 
 ========== Peer 3 conf ==========
@@ -59,7 +59,7 @@ Address = 10.0.0.3/24
 
 [Peer]
 PublicKey = eb119f5604eac33290f6d8a0dc0e52d82f17914995c4acc7a8211b2235a71fb1
-Endpoint = 154.44.3.12:3342
+Endpoint = 193.124.59.51:3342
 AllowedIPs = 10.0.0.0/24
 PersistentKeepalive = 25
 =================================
@@ -90,20 +90,21 @@ PersistentKeepalive = 25
 #endif
 #include "./third_party/eTNaCl/etweetnacl.c"
 
-#define CILK_VPN_PEER_INDEX 4
-#define CILK_VPN_TYPE_DATAGRAM 1
+#define CILK_VPN_TRANSPORT_TYPE 1
 #define CILK_VPN_TRANSPORT_HANDSHAKE_BYTE 0x00
 #define CILK_VPN_TRANSPORT_DATAGRAM_BYTE 0x01
 #define CILK_VPN_TRANSPORT_KEEPALIVE_BYTE 0x02
 #define CILK_VPN_HANDSHAKE_TO_SIGN_IP 4
 #define CILK_VPN_HANDSHAKE_TO_SIGN_PORT 2
-#define CILK_VPN_HANDSHAKE_TO_SIGN (crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP + CILK_VPN_HANDSHAKE_TO_SIGN_PORT + CILK_VPN_PEER_INDEX)
-#define CILK_VPN_HANDSHAKE_SIG (crypto_box_ZEROBYTES + crypto_sign_BYTES + CILK_VPN_HANDSHAKE_TO_SIGN)
-#define CILK_VPN_HANDSHAKE (CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES + crypto_box_PUBLICKEYBYTES + crypto_onetimeauth_BYTES + crypto_sign_BYTES + CILK_VPN_HANDSHAKE_TO_SIGN)
-#define CILK_VPN_DATAGRAM (CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES + CILK_VPN_PEER_INDEX + crypto_onetimeauth_BYTES)
+#define CILK_VPN_PEER_INDEX 4
+#define CILK_VPN_HANDSHAKE_TO_SIGN (crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP + CILK_VPN_HANDSHAKE_TO_SIGN_PORT + CILK_VPN_PEER_INDEX) //32+4+2+4=42
+#define CILK_VPN_HANDSHAKE_SIG (crypto_box_ZEROBYTES + crypto_sign_BYTES + CILK_VPN_HANDSHAKE_TO_SIGN) //64+42=106 signed handshake payload + 32 bytes for encryption
+#define CILK_VPN_HANDSHAKE (CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES + crypto_box_PUBLICKEYBYTES + crypto_onetimeauth_BYTES + crypto_sign_BYTES + CILK_VPN_HANDSHAKE_TO_SIGN) //1+24+32+16+64+42=179
+#define CILK_VPN_STATIC_HANDSHAKE_PAYLOAD (crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP + CILK_VPN_HANDSHAKE_TO_SIGN_PORT)
+#define CILK_VPN_DATAGRAM (CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES + CILK_VPN_PEER_INDEX + crypto_onetimeauth_BYTES) //1+24+4+16=45
 #define CILK_VPN_PERSISTENT_KEEPALIVE_SECONDS_DEFAULT 20
-#define CILK_VPN_INBOUND_UDP_BUFFER_SIZE 65535
 #define CILK_VPN_MAX_ALLOWED_IPS 256
+#define CILK_VPN_UDP_BUFFER_SIZE 65535
 #define CILK_VPN_TUN_BUFFER_SIZE (crypto_box_ZEROBYTES + 65535 - CILK_VPN_DATAGRAM)
 #define CILK_VPN_TUN_ENCRYPTED_BUFFER (CILK_VPN_DATAGRAM + 65535)
 #define CILK_VPN_OFFSET_TO_CRYPTOGRAPHY 13
@@ -112,12 +113,11 @@ PersistentKeepalive = 25
 #elif defined(__APPLE__) || defined(__FreeBSD__)
 #define CILK_VPN_IFACE_OFFSET 4
 #endif
-#define MAX_EVENTS 64
-#define MAX_PACKETS_PER_EVENT 64
+#define MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT 1024
+#define MAX_PACKETS_PER_ONE_EVENT_LOOP_EVENT 64
 #define MAX_CONF_LINE_LENGTH 512
 #define MAX_CONF_KEY_LENGTH 64
 #define MAX_CONF_VALUE_LENGTH 256
-
 #define MAX_IP_AS_STRING_LENGTH 16
 #define MAX_MASK_AS_LENGTH 3
 
@@ -160,8 +160,8 @@ typedef struct device_t {
     ip_address address;
     int listen_port;
     struct sockaddr_in listen_addr;
-    struct sockaddr_in inbound_peer_addr;
-    socklen_t inbound_peer_addr_len;
+    struct sockaddr_in peer_addr;
+    socklen_t peer_addr_len;
     peer* peers;
     int peers_count;
     int iface;
@@ -172,16 +172,16 @@ typedef struct device_t {
     unsigned char outbound_handshake_sig[CILK_VPN_HANDSHAKE_SIG];
     unsigned char outbound_handshake[CILK_VPN_HANDSHAKE];
     
-    int inbound_recv_bytes;
-    unsigned char inbound_encrypted[CILK_VPN_INBOUND_UDP_BUFFER_SIZE];
-    unsigned char inbound_decrypted[CILK_VPN_INBOUND_UDP_BUFFER_SIZE];
-    unsigned char inbound_handshake_key[crypto_box_BEFORENMBYTES];
-    unsigned char inbound_handshake_to_sign[CILK_VPN_HANDSHAKE_TO_SIGN];
-    
-    int outbound_read_bytes;
+	int outbound_nread;
     unsigned char outbound_iface_datagram[CILK_VPN_TUN_BUFFER_SIZE];
     unsigned char outbound_datagram[CILK_VPN_TUN_ENCRYPTED_BUFFER];
     unsigned char nonce[crypto_box_NONCEBYTES];
+	
+    int inbound_nrecv;
+    unsigned char inbound_encrypted[CILK_VPN_UDP_BUFFER_SIZE];
+    unsigned char inbound_decrypted[CILK_VPN_UDP_BUFFER_SIZE];
+    unsigned char inbound_handshake_key[crypto_box_BEFORENMBYTES];
+    unsigned char inbound_handshake_to_sign[CILK_VPN_HANDSHAKE_TO_SIGN];
 } device;
 
 void ip_to_string(uint32_t ip, char *buffer, size_t buffer_size) {
@@ -285,6 +285,429 @@ uint32_t generate_unique_inbound_peer_index(peer* peers) {
         }
     }
 }
+
+int send_handshake_2_peer(device* d, peer* p) {
+    p->inbound_peer_ix = generate_unique_inbound_peer_index(d->peers);
+    memcpy(d->outbound_handshake_to_sign + CILK_VPN_STATIC_HANDSHAKE_PAYLOAD, &p->inbound_peer_ix, CILK_VPN_PEER_INDEX);
+    crypto_sign2(d->outbound_handshake_sig + crypto_box_ZEROBYTES, d->outbound_handshake_to_sign, CILK_VPN_HANDSHAKE_TO_SIGN, d->ed25519_identity_keypair.secret_key); //auth
+    
+    crypto_box_keypair(d->x25519_ephemeral_keypair.public_key, d->x25519_ephemeral_keypair.secret_key); //gen ephemeral keypair
+    crypto_box_beforenm(p->outbound_key, p->x25519_identity_public_key, d->x25519_ephemeral_keypair.secret_key); //dh    
+    
+    unsigned char* nonce = d->outbound_handshake + CILK_VPN_TRANSPORT_TYPE;
+    randombytes(nonce, crypto_box_NONCEBYTES); //gen nonce
+	
+    unsigned char* box = d->outbound_handshake + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES + crypto_box_BOXZEROBYTES; //skip 1 byte of transport header + 24 bytes of nonce + 16 zerobytes
+    crypto_box_afternm(box, d->outbound_handshake_sig, CILK_VPN_HANDSHAKE_SIG, nonce, p->outbound_key); //encrypt
+    
+	d->outbound_handshake[0] = CILK_VPN_TRANSPORT_HANDSHAKE_BYTE;
+    memcpy(d->outbound_handshake + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES, d->x25519_ephemeral_keypair.public_key, crypto_box_PUBLICKEYBYTES); //replace 32 zero bytes on ephemeral public key
+    return sendto(d->udp, d->outbound_handshake, CILK_VPN_HANDSHAKE, 0, (struct sockaddr *)&p->endpoint_addr, sizeof(p->endpoint_addr));
+}
+
+void handle_handshake(device* d) {
+    unsigned char* peer_ephemeral_public_key = d->inbound_encrypted + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES;    
+    crypto_box_beforenm(d->inbound_handshake_key, peer_ephemeral_public_key, d->x25519_identity_keypair.secret_key); //dh
+    
+    unsigned char* nonce = d->inbound_encrypted + CILK_VPN_TRANSPORT_TYPE;
+    int inbound_len = d->inbound_nrecv - CILK_VPN_TRANSPORT_TYPE - crypto_box_NONCEBYTES - crypto_box_BOXZEROBYTES;
+    unsigned char* box = d->inbound_encrypted + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES + crypto_box_BOXZEROBYTES;
+    memset(box, 0, crypto_box_BOXZEROBYTES);    
+    if (crypto_box_open_afternm(d->inbound_decrypted, box, inbound_len, nonce, d->inbound_handshake_key) == -1) { //decrypt
+        return;
+    }
+    
+    memset(d->inbound_handshake_to_sign, 0, CILK_VPN_HANDSHAKE_TO_SIGN);
+    unsigned char* sig = d->inbound_decrypted + crypto_box_ZEROBYTES;
+    if (crypto_sign_open2(d->inbound_handshake_to_sign, sig, inbound_len - crypto_box_ZEROBYTES, sig + crypto_sign_BYTES) != 0) {  //auth (part 1)
+        return;
+    }
+    
+    peer* p = find_peer_by_ed25519_identity_public_key(d, d->inbound_handshake_to_sign); //auth (part 2)
+    if (!p){
+        return;
+    }
+    
+    update_peer_endpoint(p, d->peer_addr);
+    
+    memcpy(p->inbound_key, d->inbound_handshake_key, crypto_box_BEFORENMBYTES);
+    
+    uint32_t ip_addr;
+    memcpy(&ip_addr, d->inbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES, CILK_VPN_HANDSHAKE_TO_SIGN_IP);
+    
+    uint16_t port;
+    memcpy(&port, d->inbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP, CILK_VPN_HANDSHAKE_TO_SIGN_PORT);
+    
+    uint32_t peer_ix;
+    memcpy(&peer_ix, d->inbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP + CILK_VPN_HANDSHAKE_TO_SIGN_PORT, CILK_VPN_PEER_INDEX);
+    
+    memset(&p->local_addr, 0, sizeof(p->local_addr));
+    p->local_addr.sin_family = AF_INET;
+    p->local_addr.sin_addr.s_addr = ip_addr;
+    p->local_addr.sin_port = port;
+    
+    p->outbound_peer_ix = peer_ix;
+    
+    if (p->init_handshake == 0) {
+        if (send_handshake_2_peer(d, p) <= 0) {
+            //log
+        }
+    } else {
+        p->init_handshake = 0;
+    }
+}
+
+int encrypt_and_send_datagram_2_peer(device* d, peer* p) {
+    randombytes(d->nonce, crypto_box_NONCEBYTES);
+    memset(d->outbound_iface_datagram + CILK_VPN_IFACE_OFFSET, 0, crypto_box_ZEROBYTES);
+	int len = d->outbound_nread + crypto_box_ZEROBYTES - CILK_VPN_IFACE_OFFSET;
+    crypto_box_afternm(d->outbound_datagram + CILK_VPN_OFFSET_TO_CRYPTOGRAPHY, d->outbound_iface_datagram + CILK_VPN_IFACE_OFFSET, len, d->nonce, p->outbound_key); //encrypt
+    
+    d->outbound_datagram[0] = CILK_VPN_TRANSPORT_DATAGRAM_BYTE;
+    memcpy(d->outbound_datagram + CILK_VPN_TRANSPORT_TYPE, d->nonce, crypto_box_NONCEBYTES);
+    memcpy(d->outbound_datagram + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES, &p->outbound_peer_ix, CILK_VPN_PEER_INDEX);
+    return sendto(d->udp, d->outbound_datagram, CILK_VPN_DATAGRAM + d->outbound_nread - CILK_VPN_IFACE_OFFSET, 0, (struct sockaddr *)&p->endpoint_addr, sizeof(p->endpoint_addr));    
+}
+
+void handle_datagram(device* d) {
+	uint32_t peer_ix = *(uint32_t *)(d->inbound_encrypted + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES);
+	
+    peer* p = find_peer_by_inbound_peer_index(d->peers, peer_ix);
+    if (p == NULL) {
+        return;
+    }
+    
+    memcpy(d->nonce, d->inbound_encrypted + CILK_VPN_TRANSPORT_TYPE, crypto_box_NONCEBYTES);
+    
+    int inbound_len = d->inbound_nrecv - CILK_VPN_OFFSET_TO_CRYPTOGRAPHY;
+    unsigned char* box = d->inbound_encrypted + CILK_VPN_OFFSET_TO_CRYPTOGRAPHY;
+    memset(box, 0, crypto_box_BOXZEROBYTES);
+    
+    if (crypto_box_open_afternm(d->inbound_decrypted, box, inbound_len, d->nonce, p->inbound_key) == -1) { //decrypt 
+        return;
+    }
+    
+    uint32_t ip_src = *(uint32_t *)(d->inbound_decrypted + crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET + 12);
+    if (is_allowed_ips(p, ip_src) == -1) {
+        return;
+    }
+    
+    update_peer_endpoint(p, d->peer_addr);
+	
+#if defined(__linux__)
+    if (write(d->iface, d->inbound_decrypted + crypto_box_ZEROBYTES, inbound_len - crypto_box_ZEROBYTES) <= 0) {
+        //log
+    }
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+    unsigned char* on_freeBSD = d->inbound_decrypted + (crypto_box_ZEROBYTES - CILK_VPN_IFACE_OFFSET);
+    on_freeBSD[0] = 0;
+    on_freeBSD[1] = 0;
+    on_freeBSD[2] = 0;
+    on_freeBSD[3] = 2;
+	
+    if (write(d->iface, on_freeBSD, inbound_len - crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET) <= 0) {
+        //log
+    }
+#endif
+}
+
+void cilkVPN__recv(device* d) {
+    d->inbound_nrecv = recvfrom(d->udp, d->inbound_encrypted, CILK_VPN_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->peer_addr, &d->peer_addr_len);
+    
+    if (d->inbound_nrecv < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return;
+        }
+    
+        //log
+        return;
+    }
+    
+    if (d->inbound_nrecv == 0) {
+        return;
+    }
+    
+    if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_HANDSHAKE_BYTE) {
+        handle_handshake(d);
+    } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_DATAGRAM_BYTE) {
+        handle_datagram(d);
+    } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_KEEPALIVE_BYTE) {
+        //handle_keepalive(d);
+    }
+}
+
+void cilkVPN__read(device* d) {
+    d->outbound_nread = read(d->iface, d->outbound_iface_datagram + crypto_box_ZEROBYTES, CILK_VPN_TUN_BUFFER_SIZE);
+    
+    if (d->outbound_nread < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return;
+        }
+    
+        //log
+        return;
+    }
+    
+    if (d->outbound_nread == 0) {
+        return;
+    }
+    
+    uint32_t ip_dst = *(uint32_t *)(d->outbound_iface_datagram + crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET + 16);
+    
+    peer* p = find_peer_by_allowed_ip(d->peers, ip_dst);
+    if (p == NULL) {
+        return;
+    }
+    
+    if (p->outbound_peer_ix == 0) {
+        return;
+    }
+    
+    if (encrypt_and_send_datagram_2_peer(d, p) <= 0) {
+        //log
+    }
+}
+
+void cilkVPN__recv2(device* d) {
+	for (int i = 0; i < MAX_PACKETS_PER_ONE_EVENT_LOOP_EVENT; i++) {
+	    d->inbound_nrecv = recvfrom(d->udp, d->inbound_encrypted, CILK_VPN_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->peer_addr, &d->peer_addr_len);
+		
+        if (d->inbound_nrecv < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+
+            //log
+            return;
+        }
+
+        if (d->inbound_nrecv == 0) {
+            return;
+        }
+	    
+        if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_HANDSHAKE_BYTE) {
+            handle_handshake(d);
+        } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_DATAGRAM_BYTE) {
+            handle_datagram(d);
+        } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_KEEPALIVE_BYTE) {
+            //handle_keepalive(d);
+        }
+	}
+}
+
+void cilkVPN__read2(device* d) {
+	for (int i = 0; i < MAX_PACKETS_PER_ONE_EVENT_LOOP_EVENT; i++) {
+		d->outbound_nread = read(d->iface, d->outbound_iface_datagram + crypto_box_ZEROBYTES, CILK_VPN_TUN_BUFFER_SIZE);
+		
+        if (d->outbound_nread < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+
+            //log
+            return;
+        }
+
+        if (d->outbound_nread == 0) {
+            return;
+        }
+        
+        uint32_t ip_dst = *(uint32_t *)(d->outbound_iface_datagram + crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET + 16);
+        
+        peer* p = find_peer_by_allowed_ip(d->peers, ip_dst);
+        if (p == NULL) {
+            return;
+        }
+        
+        if (p->outbound_peer_ix == 0) {
+            return;
+        }
+        
+        if (encrypt_and_send_datagram_2_peer(d, p) <= 0) {
+            //log
+        }
+	}
+}
+
+void cilkVPN__recv3(device* d) {
+	while (1) {
+	    d->inbound_nrecv = recvfrom(d->udp, d->inbound_encrypted, CILK_VPN_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->peer_addr, &d->peer_addr_len);
+		
+        if (d->inbound_nrecv < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+
+            //log
+            return;
+        }
+
+        if (d->inbound_nrecv == 0) {
+            return;
+        }
+	    
+        if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_HANDSHAKE_BYTE) {
+            handle_handshake(d);
+        } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_DATAGRAM_BYTE) {
+            handle_datagram(d);
+        } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_KEEPALIVE_BYTE) {
+            //handle_keepalive(d);
+        }
+	}
+}
+
+void cilkVPN__read3(device* d) {
+	while (1) {
+		d->outbound_nread = read(d->iface, d->outbound_iface_datagram + crypto_box_ZEROBYTES, CILK_VPN_TUN_BUFFER_SIZE);
+		
+        if (d->outbound_nread < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+
+            //log
+            return;
+        }
+
+        if (d->outbound_nread == 0) {
+            return;
+        }
+        
+        uint32_t ip_dst = *(uint32_t *)(d->outbound_iface_datagram + crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET + 16);
+        
+        peer* p = find_peer_by_allowed_ip(d->peers, ip_dst);
+        if (p == NULL) {
+            return;
+        }
+        
+        if (p->outbound_peer_ix == 0) {
+            return;
+        }
+        
+        if (encrypt_and_send_datagram_2_peer(d, p) <= 0) {
+            //log
+        }
+	}
+}
+
+int make_udp(const struct sockaddr* listen_addr, size_t listen_addr_len) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    
+    int reuse = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    bind(fd, listen_addr, listen_addr_len);
+    
+    return fd;
+}
+
+#if defined(__linux__)
+//https://www.baeldung.com/linux/tun-interface-purpose
+
+int tun_open(char* devname) {
+    struct ifreq ifr;
+    int fd, err;
+    
+    if ((fd = open("/dev/net/tun", O_RDWR)) == -1) {
+        perror("open /dev/net/tun");
+        exit(1);
+    }
+    
+    memset(&ifr, 0, sizeof(ifr));
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI; // Убирает 4 байта на linux, которые к пакету не относятся, а обозначают протокол
+    strncpy(ifr.ifr_name, devname, IFNAMSIZ); // devname = "tun0" or "tun1", etc
+    
+    /* ioctl will use ifr.if_name as the name of TUN interface to open: "tun0", etc. */
+    if ((err = ioctl(fd, TUNSETIFF, (void*)&ifr)) == -1) {
+        perror("ioctl TUNSETIFF");
+        close(fd);
+        exit(1);
+    }
+    
+    fcntl(fd, F_SETFL, fcntl( fd, F_GETFL, 0) | O_NONBLOCK);
+    
+    /* After the ioctl call the fd is "connected" to tun device specified by devname ("tun0", "tun1", etc)*/
+    
+    return fd;
+}
+
+int make_epoll(int iface, int udp){
+    int epfd = epoll_create1(0);
+    
+    struct epoll_event ev;
+    ev.events = EPOLLIN; //Отслеживаем появление данных для чтения
+    
+    ev.data.fd = udp;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, udp, &ev);
+    
+    ev.data.fd = iface;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, iface, &ev);
+    
+    return epfd;
+}
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+//https://gist.github.com/ssrlive/0dd4776d7fc656e5bfb807a59e7f82a0
+
+int utun_open(char name[20]) {
+    struct sockaddr_ctl sc;
+    struct ctl_info ctlInfo;
+    int fd;
+    
+    memset(&ctlInfo, 0, sizeof(ctlInfo));
+    if (strlcpy(ctlInfo.ctl_name, UTUN_CONTROL_NAME, sizeof(ctlInfo.ctl_name)) >=
+        sizeof(ctlInfo.ctl_name)) {
+        fprintf(stderr,"UTUN_CONTROL_NAME too long");
+        return -1;
+    }
+    
+    fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+    if (fd == -1) {
+        perror ("socket(SYSPROTO_CONTROL)");
+        return -1;
+    }
+    
+    if (ioctl(fd, CTLIOCGINFO, &ctlInfo) == -1) {
+        perror ("ioctl(CTLIOCGINFO)");
+        close(fd);
+        return -1;
+    }
+    
+    fcntl(fd, F_SETFL, fcntl( fd, F_GETFL, 0) | O_NONBLOCK);
+    
+    sc.sc_id = ctlInfo.ctl_id;
+    sc.sc_len = sizeof(sc);
+    sc.sc_family = AF_SYSTEM;
+    sc.ss_sysaddr = AF_SYS_CONTROL;
+    sc.sc_unit = 0; /* create now interface, in this example... */
+    
+    // If the connect is successful, a tun%d device will be created, where "%d"
+    // is our unit number -1
+    
+    if (connect(fd, (struct sockaddr *)&sc, sizeof(sc)) == -1) {
+        perror ("connect(AF_SYS_CONTROL)");
+        close(fd);
+        return -1;
+    }
+    
+    char ifname[20] = { 0 };
+    socklen_t ifname_len = sizeof(ifname);
+    getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME, ifname, &ifname_len);
+    strncpy(name, ifname, ifname_len);
+    
+    return fd;
+}
+
+int make_kqueue(int iface, int udp){
+    int kq = kqueue();
+    
+    struct kevent evSet[2];
+    EV_SET(&evSet[0], udp, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    EV_SET(&evSet[1], iface, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    kevent(kq, evSet, 2, NULL, 0, NULL);
+    
+    return kq;
+}
+#endif
 
 FILE* open_config_file(const char* config_file) {
     FILE* f = fopen(config_file, "r");
@@ -711,438 +1134,10 @@ device* make_device_from_config(const char* config_file) {
     d->listen_addr.sin_addr.s_addr = INADDR_ANY; // Listen on all network interfaces
     d->listen_addr.sin_port = htons(d->listen_port);
     
-    d->inbound_peer_addr_len = sizeof(d->inbound_peer_addr);
+    d->peer_addr_len = sizeof(d->peer_addr);
             
     return d;
 }
-
-int send_handshake_2_peer(device* d, peer* p) {
-    p->inbound_peer_ix = generate_unique_inbound_peer_index(d->peers);
-    memcpy(d->outbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP + CILK_VPN_HANDSHAKE_TO_SIGN_PORT, &p->inbound_peer_ix, CILK_VPN_PEER_INDEX);
-    crypto_sign2(d->outbound_handshake_sig + crypto_box_ZEROBYTES, d->outbound_handshake_to_sign, CILK_VPN_HANDSHAKE_TO_SIGN, d->ed25519_identity_keypair.secret_key); //auth
-    
-    crypto_box_keypair(d->x25519_ephemeral_keypair.public_key, d->x25519_ephemeral_keypair.secret_key); //gen ephemeral keypair
-    crypto_box_beforenm(p->outbound_key, p->x25519_identity_public_key, d->x25519_ephemeral_keypair.secret_key); //dh    
-    
-    memset(d->outbound_handshake, 0, CILK_VPN_HANDSHAKE);
-    d->outbound_handshake[0] = CILK_VPN_TRANSPORT_HANDSHAKE_BYTE;
-    
-    unsigned char* outbound_handshake_nonce = d->outbound_handshake + CILK_VPN_TYPE_DATAGRAM;
-    randombytes(outbound_handshake_nonce, crypto_box_NONCEBYTES); //gen nonce
-    
-    unsigned char* box = d->outbound_handshake + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES + crypto_box_BOXZEROBYTES; //skip 1 byte of transport header + 24 bytes of nonce + 16 zerobytes
-    crypto_box_afternm(box, d->outbound_handshake_sig, CILK_VPN_HANDSHAKE_SIG, outbound_handshake_nonce, p->outbound_key); //encrypt
-    
-    memcpy(d->outbound_handshake + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES, d->x25519_ephemeral_keypair.public_key, crypto_box_PUBLICKEYBYTES); //replace 32 zero bytes on ephemeral public key
-    
-    return sendto(d->udp, d->outbound_handshake, CILK_VPN_HANDSHAKE, 0, (struct sockaddr *)&p->endpoint_addr, sizeof(p->endpoint_addr));
-}
-
-void handle_handshake(device* d) {
-    unsigned char* peer_ephemeral_public_key = d->inbound_encrypted + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES;    
-    crypto_box_beforenm(d->inbound_handshake_key, peer_ephemeral_public_key, d->x25519_identity_keypair.secret_key); //dh
-    
-    unsigned char* nonce = d->inbound_encrypted + CILK_VPN_TYPE_DATAGRAM;
-    int inbound_unboxed_datagram_len = d->inbound_recv_bytes - CILK_VPN_TYPE_DATAGRAM - crypto_box_NONCEBYTES - crypto_box_BOXZEROBYTES;
-    unsigned char* box = d->inbound_encrypted + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES + crypto_box_BOXZEROBYTES;
-    memset(box, 0, crypto_box_BOXZEROBYTES);    
-    if (crypto_box_open_afternm(d->inbound_decrypted, box, inbound_unboxed_datagram_len, nonce, d->inbound_handshake_key) == -1) { //decrypt
-        return;
-    }
-    
-    memset(d->inbound_handshake_to_sign, 0, CILK_VPN_HANDSHAKE_TO_SIGN);
-    unsigned char* sig = d->inbound_decrypted + crypto_box_ZEROBYTES;
-    unsigned long long sig_len = inbound_unboxed_datagram_len - crypto_box_ZEROBYTES;
-    if (crypto_sign_open2(d->inbound_handshake_to_sign, sig, sig_len, sig + crypto_sign_BYTES) != 0) {  //auth (part 1)
-        return;
-    }
-    
-    peer* p = find_peer_by_ed25519_identity_public_key(d, d->inbound_handshake_to_sign); //auth (part 2)
-    if (!p){
-        return;
-    }
-    
-    update_peer_endpoint(p, d->inbound_peer_addr);
-    
-    memcpy(p->inbound_key, d->inbound_handshake_key, crypto_box_BEFORENMBYTES);
-    
-    uint32_t ip_addr;
-    memcpy(&ip_addr, d->inbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES, CILK_VPN_HANDSHAKE_TO_SIGN_IP);
-    
-    uint16_t port;
-    memcpy(&port, d->inbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP, CILK_VPN_HANDSHAKE_TO_SIGN_PORT);
-    
-    uint32_t peer_index;
-    memcpy(&peer_index, d->inbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP + CILK_VPN_HANDSHAKE_TO_SIGN_PORT, CILK_VPN_PEER_INDEX);
-    
-    memset(&p->local_addr, 0, sizeof(p->local_addr));
-    p->local_addr.sin_family = AF_INET;
-    p->local_addr.sin_addr.s_addr = ip_addr;
-    p->local_addr.sin_port = port;
-    
-    p->outbound_peer_ix = peer_index;
-    
-    if (p->init_handshake == 0) {
-        if (send_handshake_2_peer(d, p) <= 0) {
-            //log
-        }
-    } else {
-        p->init_handshake = 0;
-    }
-}
-
-int encrypt_and_send_datagram_2_peer(device* d, peer* p) {
-    randombytes(d->nonce, crypto_box_NONCEBYTES);
-    memset(d->outbound_iface_datagram + CILK_VPN_IFACE_OFFSET, 0, crypto_box_ZEROBYTES);
-	int len = d->outbound_read_bytes + crypto_box_ZEROBYTES - CILK_VPN_IFACE_OFFSET;
-    crypto_box_afternm(d->outbound_datagram + CILK_VPN_OFFSET_TO_CRYPTOGRAPHY, d->outbound_iface_datagram + CILK_VPN_IFACE_OFFSET, len, d->nonce, p->outbound_key); //encrypt
-    
-    d->outbound_datagram[0] = CILK_VPN_TRANSPORT_DATAGRAM_BYTE;
-    memcpy(d->outbound_datagram + CILK_VPN_TYPE_DATAGRAM, d->nonce, crypto_box_NONCEBYTES);
-    memcpy(d->outbound_datagram + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES, &p->outbound_peer_ix, CILK_VPN_PEER_INDEX);
-    return sendto(d->udp, d->outbound_datagram, CILK_VPN_DATAGRAM + d->outbound_read_bytes - CILK_VPN_IFACE_OFFSET, 0, (struct sockaddr *)&p->endpoint_addr, sizeof(p->endpoint_addr));    
-}
-
-void handle_datagram(device* d) {
-    uint32_t peer_ix;
-    memcpy(&peer_ix, d->inbound_encrypted + CILK_VPN_TYPE_DATAGRAM + crypto_box_NONCEBYTES, CILK_VPN_PEER_INDEX);
-	
-    peer* p = find_peer_by_inbound_peer_index(d->peers, peer_ix);
-    if (p == NULL) {
-        return;
-    }
-    
-    memcpy(d->nonce, d->inbound_encrypted + CILK_VPN_TYPE_DATAGRAM, crypto_box_NONCEBYTES);
-    
-    int inbound_unboxed_datagram_len = d->inbound_recv_bytes - CILK_VPN_OFFSET_TO_CRYPTOGRAPHY;
-    unsigned char* box = d->inbound_encrypted + CILK_VPN_OFFSET_TO_CRYPTOGRAPHY;
-    memset(box, 0, crypto_box_BOXZEROBYTES);
-    
-    if (crypto_box_open_afternm(d->inbound_decrypted, box, inbound_unboxed_datagram_len, d->nonce, p->inbound_key) == -1) { //decrypt 
-        return;
-    }
-    
-    uint32_t ip_src = *(uint32_t *)(d->inbound_decrypted + crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET + 12);
-    if (is_allowed_ips(p, ip_src) == -1) {
-        return;
-    }
-    
-    update_peer_endpoint(p, d->inbound_peer_addr);
-	
-#if defined(__linux__)
-    if (write(d->iface, d->inbound_decrypted + crypto_box_ZEROBYTES, inbound_unboxed_datagram_len - crypto_box_ZEROBYTES) <= 0) {
-        //log
-    }
-#elif defined(__APPLE__) || defined(__FreeBSD__)
-    unsigned char* to_write_on_freeBSD = d->inbound_decrypted + (crypto_box_ZEROBYTES - CILK_VPN_IFACE_OFFSET);
-    to_write_on_freeBSD[0] = 0;
-    to_write_on_freeBSD[1] = 0;
-    to_write_on_freeBSD[2] = 0;
-    to_write_on_freeBSD[3] = 2;
-	
-    if (write(d->iface, to_write_on_freeBSD, inbound_unboxed_datagram_len - crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET) <= 0) {
-        //log
-    }
-#endif
-}
-
-void cilkVPN__recv(device* d) {
-    d->inbound_recv_bytes = recvfrom(d->udp, d->inbound_encrypted, CILK_VPN_INBOUND_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->inbound_peer_addr, &d->inbound_peer_addr_len);
-    
-    if (d->inbound_recv_bytes < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return;
-        }
-    
-        //log
-        return;
-    }
-    
-    if (d->inbound_recv_bytes == 0) {
-        return;
-    }
-    
-    if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_HANDSHAKE_BYTE) {
-        handle_handshake(d);
-    } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_DATAGRAM_BYTE) {
-        handle_datagram(d);
-    } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_KEEPALIVE_BYTE) {
-        //handle_keepalive(d);
-    }
-}
-
-void cilkVPN__read(device* d) {
-    d->outbound_read_bytes = read(d->iface, d->outbound_iface_datagram + crypto_box_ZEROBYTES, CILK_VPN_TUN_BUFFER_SIZE);
-    
-    if (d->outbound_read_bytes < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return;
-        }
-    
-        //log
-        return;
-    }
-    
-    if (d->outbound_read_bytes == 0) {
-        return;
-    }
-    
-    uint32_t ip_dst = *(uint32_t *)(d->outbound_iface_datagram + crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET + 16);
-    
-    peer* p = find_peer_by_allowed_ip(d->peers, ip_dst);
-    if (p == NULL) {
-        return;
-    }
-    
-    if (p->outbound_peer_ix == 0) {
-        return;
-    }
-    
-    if (encrypt_and_send_datagram_2_peer(d, p) <= 0) {
-        //log
-    }
-}
-
-void cilkVPN__recv2(device* d) {
-	for (int i = 0; i < MAX_PACKETS_PER_EVENT; i++) {
-	    d->inbound_recv_bytes = recvfrom(d->udp, d->inbound_encrypted, CILK_VPN_INBOUND_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->inbound_peer_addr, &d->inbound_peer_addr_len);
-		
-        if (d->inbound_recv_bytes < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
-            }
-
-            //log
-            return;
-        }
-
-        if (d->inbound_recv_bytes == 0) {
-            return;
-        }
-	    
-        if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_HANDSHAKE_BYTE) {
-            handle_handshake(d);
-        } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_DATAGRAM_BYTE) {
-            handle_datagram(d);
-        } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_KEEPALIVE_BYTE) {
-            //handle_keepalive(d);
-        }
-	}
-}
-
-void cilkVPN__read2(device* d) {
-	for (int i = 0; i < MAX_PACKETS_PER_EVENT; i++) {
-		d->outbound_read_bytes = read(d->iface, d->outbound_iface_datagram + crypto_box_ZEROBYTES, CILK_VPN_TUN_BUFFER_SIZE);
-		
-        if (d->outbound_read_bytes < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
-            }
-
-            //log
-            return;
-        }
-
-        if (d->outbound_read_bytes == 0) {
-            return;
-        }
-        
-        uint32_t ip_dst = *(uint32_t *)(d->outbound_iface_datagram + crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET + 16);
-        
-        peer* p = find_peer_by_allowed_ip(d->peers, ip_dst);
-        if (p == NULL) {
-            return;
-        }
-        
-        if (p->outbound_peer_ix == 0) {
-            return;
-        }
-        
-        if (encrypt_and_send_datagram_2_peer(d, p) <= 0) {
-            //log
-        }
-	}
-}
-
-void cilkVPN__recv3(device* d) {
-	while (1) {
-	    d->inbound_recv_bytes = recvfrom(d->udp, d->inbound_encrypted, CILK_VPN_INBOUND_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->inbound_peer_addr, &d->inbound_peer_addr_len);
-		
-        if (d->inbound_recv_bytes < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
-            }
-
-            //log
-            return;
-        }
-
-        if (d->inbound_recv_bytes == 0) {
-            return;
-        }
-	    
-        if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_HANDSHAKE_BYTE) {
-            handle_handshake(d);
-        } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_DATAGRAM_BYTE) {
-            handle_datagram(d);
-        } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_KEEPALIVE_BYTE) {
-            //handle_keepalive(d);
-        }
-	}
-}
-
-void cilkVPN__read3(device* d) {
-	while (1) {
-		d->outbound_read_bytes = read(d->iface, d->outbound_iface_datagram + crypto_box_ZEROBYTES, CILK_VPN_TUN_BUFFER_SIZE);
-		
-        if (d->outbound_read_bytes < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
-            }
-
-            //log
-            return;
-        }
-
-        if (d->outbound_read_bytes == 0) {
-            return;
-        }
-        
-        uint32_t ip_dst = *(uint32_t *)(d->outbound_iface_datagram + crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET + 16);
-        
-        peer* p = find_peer_by_allowed_ip(d->peers, ip_dst);
-        if (p == NULL) {
-            return;
-        }
-        
-        if (p->outbound_peer_ix == 0) {
-            return;
-        }
-        
-        if (encrypt_and_send_datagram_2_peer(d, p) <= 0) {
-            //log
-        }
-	}
-}
-
-int make_udp(const struct sockaddr* listen_addr, size_t listen_addr_len) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    
-    int reuse = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-    bind(fd, listen_addr, listen_addr_len);
-    
-    return fd;
-}
-
-#if defined(__linux__)
-//https://www.baeldung.com/linux/tun-interface-purpose
-
-int tun_open(char* devname) {
-    struct ifreq ifr;
-    int fd, err;
-    
-    if ((fd = open("/dev/net/tun", O_RDWR)) == -1) {
-        perror("open /dev/net/tun");
-        exit(1);
-    }
-    
-    memset(&ifr, 0, sizeof(ifr));
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI; // Убирает 4 байта на linux, которые к пакету не относятся, а обозначают протокол
-    strncpy(ifr.ifr_name, devname, IFNAMSIZ); // devname = "tun0" or "tun1", etc
-    
-    /* ioctl will use ifr.if_name as the name of TUN interface to open: "tun0", etc. */
-    if ((err = ioctl(fd, TUNSETIFF, (void*)&ifr)) == -1) {
-        perror("ioctl TUNSETIFF");
-        close(fd);
-        exit(1);
-    }
-    
-    fcntl(fd, F_SETFL, fcntl( fd, F_GETFL, 0) | O_NONBLOCK);
-    
-    /* After the ioctl call the fd is "connected" to tun device specified by devname ("tun0", "tun1", etc)*/
-    
-    return fd;
-}
-
-int make_epoll(int iface, int udp){
-    int epfd = epoll_create1(0);
-    
-    struct epoll_event ev;
-    ev.events = EPOLLIN; //Отслеживаем появление данных для чтения
-    
-    ev.data.fd = udp;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, udp, &ev);
-    
-    ev.data.fd = iface;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, iface, &ev);
-    
-    return epfd;
-}
-#elif defined(__APPLE__) || defined(__FreeBSD__)
-//https://gist.github.com/ssrlive/0dd4776d7fc656e5bfb807a59e7f82a0
-
-int utun_open(char name[20]) {
-    struct sockaddr_ctl sc;
-    struct ctl_info ctlInfo;
-    int fd;
-    
-    memset(&ctlInfo, 0, sizeof(ctlInfo));
-    if (strlcpy(ctlInfo.ctl_name, UTUN_CONTROL_NAME, sizeof(ctlInfo.ctl_name)) >=
-        sizeof(ctlInfo.ctl_name)) {
-        fprintf(stderr,"UTUN_CONTROL_NAME too long");
-        return -1;
-    }
-    
-    fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
-    if (fd == -1) {
-        perror ("socket(SYSPROTO_CONTROL)");
-        return -1;
-    }
-    
-    if (ioctl(fd, CTLIOCGINFO, &ctlInfo) == -1) {
-        perror ("ioctl(CTLIOCGINFO)");
-        close(fd);
-        return -1;
-    }
-    
-    fcntl(fd, F_SETFL, fcntl( fd, F_GETFL, 0) | O_NONBLOCK);
-    
-    sc.sc_id = ctlInfo.ctl_id;
-    sc.sc_len = sizeof(sc);
-    sc.sc_family = AF_SYSTEM;
-    sc.ss_sysaddr = AF_SYS_CONTROL;
-    sc.sc_unit = 0; /* create now interface, in this example... */
-    
-    // If the connect is successful, a tun%d device will be created, where "%d"
-    // is our unit number -1
-    
-    if (connect(fd, (struct sockaddr *)&sc, sizeof(sc)) == -1) {
-        perror ("connect(AF_SYS_CONTROL)");
-        close(fd);
-        return -1;
-    }
-    
-    char ifname[20] = { 0 };
-    socklen_t ifname_len = sizeof(ifname);
-    getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME, ifname, &ifname_len);
-    strncpy(name, ifname, ifname_len);
-    
-    return fd;
-}
-
-int make_kqueue(int iface, int udp){
-    int kq = kqueue();
-    
-    struct kevent evSet[2];
-    EV_SET(&evSet[0], udp, EVFILT_READ, EV_ADD, 0, 0, NULL);
-    EV_SET(&evSet[1], iface, EVFILT_READ, EV_ADD, 0, 0, NULL);
-    kevent(kq, evSet, 2, NULL, 0, NULL);
-    
-    return kq;
-}
-#endif
 
 int main(int argc, char **argv) {
     const char* config_file = "cilkVPN.conf";
@@ -1190,30 +1185,30 @@ int main(int argc, char **argv) {
     }
     
 #if defined(__linux__)
-    struct epoll_event events[MAX_EVENTS];
+    struct epoll_event events[MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT];
     
     while (1) {
-        int nfds = epoll_wait(d->el, events, MAX_EVENTS, -1);
+        int nfds = epoll_wait(d->el, events, MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT, -1);
 
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.fd == d->udp) {
-                cilkVPN__recv3(d);
+                cilkVPN__recv2(d);
             } else if (events[i].data.fd == d->iface) {
-                cilkVPN__read3(d);
+                cilkVPN__read2(d);
             }
         }
     }
 #elif defined(__APPLE__) || defined(__FreeBSD__)
-    struct kevent events[MAX_EVENTS];
+    struct kevent events[MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT];
     
     while (1) {
-        int nfds = kevent(d->el, NULL, 0, events, MAX_EVENTS, NULL);
+        int nfds = kevent(d->el, NULL, 0, events, MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT, NULL);
         
         for (int i = 0; i < nfds; i++) {
             if ((int)events[i].ident == d->udp) {
-                cilkVPN__recv3(d);
+                cilkVPN__recv2(d);
             } else if ((int)events[i].ident == d->iface) {
-                cilkVPN__read3(d);
+                cilkVPN__read2(d);
             }
         }
     }
