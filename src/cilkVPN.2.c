@@ -1,14 +1,6 @@
 /*
 clang ./cilkVPN.2.c -O3 -o ./cilkVPN
 
-Peer 1:
-sudo ip tuntap add dev cilk0 mode tun  
-sudo ip link set mtu 1400 dev cilk0
-sudo ip addr add 10.0.0.1/24 dev cilk0
-sudo ip link set dev cilk0 up
-sudo ip route add 10.0.0.0/24 dev cilk0
-sudo ./cilkVPN
-
 ========== Peer 1 conf ==========
 [Interface]
 ListenPort = 3342
@@ -23,11 +15,9 @@ AllowedIPs = 10.0.0.2/32
 PublicKey = e8c93c2a3426ea3a0e5b03dd7bb495725ddf13e23abdbf2997dba18f521d5dd0
 AllowedIPs = 10.0.0.3/32
 =================================
-
-Peer 2:
 sudo ip tuntap add dev cilk0 mode tun  
+sudo ip addr add 10.0.0.1/24 dev cilk0
 sudo ip link set mtu 1400 dev cilk0
-sudo ip addr add 10.0.0.2/24 dev cilk0
 sudo ip link set dev cilk0 up
 sudo ip route add 10.0.0.0/24 dev cilk0
 sudo ./cilkVPN
@@ -44,12 +34,12 @@ Endpoint = 193.124.59.51:3342
 AllowedIPs = 10.0.0.0/24
 PersistentKeepalive = 25
 =================================
-
-Peer 3:
+sudo ip tuntap add dev cilk0 mode tun  
+sudo ip addr add 10.0.0.2/24 dev cilk0
+sudo ip link set mtu 1400 dev cilk0
+sudo ip link set dev cilk0 up
+sudo ip route add 10.0.0.0/24 dev cilk0
 sudo ./cilkVPN
-sudo ifconfig utun5 inet 10.0.0.3/32 10.0.0.3 alias
-sudo route add -net 10.0.0.0/24 -interface utun5
-sudo ifconfig utun5 up
 
 ========== Peer 3 conf ==========
 [Interface]
@@ -63,6 +53,11 @@ Endpoint = 193.124.59.51:3342
 AllowedIPs = 10.0.0.0/24
 PersistentKeepalive = 25
 =================================
+sudo ./cilkVPN
+sudo ifconfig utun5 inet 10.0.0.3/32 10.0.0.3 alias
+sudo ifconfig utun5 mtu 1400
+sudo route add -net 10.0.0.0/24 -interface utun5
+sudo ifconfig utun5 up
 */
 
 #include <string.h>
@@ -1192,9 +1187,9 @@ int main(int argc, char **argv) {
 
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.fd == d->udp) {
-                cilkVPN__recv2(d);
+                cilkVPN__recv3(d);
             } else if (events[i].data.fd == d->iface) {
-                cilkVPN__read2(d);
+                cilkVPN__read3(d);
             }
         }
     }
@@ -1206,9 +1201,9 @@ int main(int argc, char **argv) {
         
         for (int i = 0; i < nfds; i++) {
             if ((int)events[i].ident == d->udp) {
-                cilkVPN__recv2(d);
+                cilkVPN__recv3(d);
             } else if ((int)events[i].ident == d->iface) {
-                cilkVPN__read2(d);
+                cilkVPN__read3(d);
             }
         }
     }
