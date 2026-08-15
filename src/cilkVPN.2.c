@@ -673,8 +673,6 @@ void exec_base_iface_linux_commands(device* d) {
 	char network_addr_str[INET_ADDRSTRLEN];
     ip_to_string(network_addr, network_addr_str, sizeof(network_addr_str));
 	
-//sudo ip route add 10.0.0.0/24 dev cilk0
-
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "ip addr add %s/%d dev cilk0", ip_str, mask);
     exec(cmd);
