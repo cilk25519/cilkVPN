@@ -92,13 +92,10 @@ sudo ifconfig utun5 up
 #define CILK_VPN_TRANSPORT_HANDSHAKE_BYTE 0x00
 #define CILK_VPN_TRANSPORT_DATAGRAM_BYTE 0x01
 #define CILK_VPN_TRANSPORT_KEEPALIVE_BYTE 0x02
-#define CILK_VPN_HANDSHAKE_TO_SIGN_IP 4
-#define CILK_VPN_HANDSHAKE_TO_SIGN_PORT 2
 #define CILK_VPN_PEER_INDEX 4
-#define CILK_VPN_HANDSHAKE_TO_SIGN (crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP + CILK_VPN_HANDSHAKE_TO_SIGN_PORT + CILK_VPN_PEER_INDEX) //32+4+2+4=42
-#define CILK_VPN_HANDSHAKE_SIG (crypto_box_ZEROBYTES + crypto_sign_BYTES + CILK_VPN_HANDSHAKE_TO_SIGN) //64+42=106 signed handshake payload + 32 bytes for encryption
-#define CILK_VPN_HANDSHAKE (CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES + crypto_box_PUBLICKEYBYTES + crypto_onetimeauth_BYTES + crypto_sign_BYTES + CILK_VPN_HANDSHAKE_TO_SIGN) //1+24+32+16+64+42=179
-#define CILK_VPN_STATIC_HANDSHAKE_PAYLOAD (crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP + CILK_VPN_HANDSHAKE_TO_SIGN_PORT)
+#define CILK_VPN_HANDSHAKE_TO_SIGN (crypto_sign_PUBLICKEYBYTES + CILK_VPN_PEER_INDEX) //32+4=36
+#define CILK_VPN_HANDSHAKE_SIG (crypto_box_ZEROBYTES + crypto_sign_BYTES + CILK_VPN_HANDSHAKE_TO_SIGN) //64+32=96 signed handshake payload + 32 bytes for encryption
+#define CILK_VPN_HANDSHAKE (CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES + crypto_box_PUBLICKEYBYTES + crypto_onetimeauth_BYTES + crypto_sign_BYTES + CILK_VPN_HANDSHAKE_TO_SIGN) //1+24+32+16+64+36=173
 #define CILK_VPN_DATAGRAM (CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES + CILK_VPN_PEER_INDEX + crypto_onetimeauth_BYTES) //1+24+4+16=45
 #define CILK_VPN_MAX_ALLOWED_IPS 256
 #define CILK_VPN_UDP_BUFFER_SIZE 65535
@@ -251,7 +248,7 @@ uint32_t generate_unique_inbound_peer_index(peer* peers) {
 
 int send_handshake_2_peer(device* d, peer* p) {
     p->inbound_peer_ix = generate_unique_inbound_peer_index(d->peers);
-    memcpy(d->outbound_handshake_to_sign + CILK_VPN_STATIC_HANDSHAKE_PAYLOAD, &p->inbound_peer_ix, CILK_VPN_PEER_INDEX);
+    memcpy(d->outbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES, &p->inbound_peer_ix, CILK_VPN_PEER_INDEX);
     crypto_sign2(d->outbound_handshake_sig + crypto_box_ZEROBYTES, d->outbound_handshake_to_sign, CILK_VPN_HANDSHAKE_TO_SIGN, d->ed25519_identity_keypair.secret_key); //auth
     
     crypto_box_keypair(d->x25519_ephemeral_keypair.public_key, d->x25519_ephemeral_keypair.secret_key); //gen ephemeral keypair
@@ -275,7 +272,7 @@ void handle_handshake(device* d) {
     unsigned char* nonce = d->inbound_encrypted + CILK_VPN_TRANSPORT_TYPE;
     int inbound_len = d->inbound_nrecv - CILK_VPN_TRANSPORT_TYPE - crypto_box_NONCEBYTES - crypto_box_BOXZEROBYTES;
     unsigned char* box = d->inbound_encrypted + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES + crypto_box_BOXZEROBYTES;
-    memset(box, 0, crypto_box_BOXZEROBYTES);    
+    memset(box, 0, crypto_box_BOXZEROBYTES);
     if (crypto_box_open_afternm(d->inbound_decrypted, box, inbound_len, nonce, d->inbound_handshake_key) == -1) { //decrypt
         return;
     }
@@ -295,20 +292,8 @@ void handle_handshake(device* d) {
     
     memcpy(p->inbound_key, d->inbound_handshake_key, crypto_box_BEFORENMBYTES);
     
-    uint32_t ip_addr;
-    memcpy(&ip_addr, d->inbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES, CILK_VPN_HANDSHAKE_TO_SIGN_IP);
-    
-    uint16_t port;
-    memcpy(&port, d->inbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP, CILK_VPN_HANDSHAKE_TO_SIGN_PORT);
-    
     uint32_t peer_ix;
-    memcpy(&peer_ix, d->inbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP + CILK_VPN_HANDSHAKE_TO_SIGN_PORT, CILK_VPN_PEER_INDEX);
-    
-    memset(&p->local_addr, 0, sizeof(p->local_addr));
-    p->local_addr.sin_family = AF_INET;
-    p->local_addr.sin_addr.s_addr = ip_addr;
-    p->local_addr.sin_port = port;
-    
+    memcpy(&peer_ix, d->inbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES, CILK_VPN_PEER_INDEX);    
     p->outbound_peer_ix = peer_ix;
     
     if (p->init_handshake == 0) {
@@ -993,9 +978,6 @@ device* make_device_from_config(const char* config_file) {
     }
     
     memcpy(d->outbound_handshake_to_sign, d->ed25519_identity_keypair.public_key, crypto_sign_PUBLICKEYBYTES);
-    memcpy(d->outbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES, &d->address.ip, CILK_VPN_HANDSHAKE_TO_SIGN_IP);
-    uint16_t listen_port = htons((uint16_t)d->listen_port);
-    memcpy(d->outbound_handshake_to_sign + crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP, &listen_port, CILK_VPN_HANDSHAKE_TO_SIGN_PORT);
     
     memset(&d->listen_addr, 0, sizeof(d->listen_addr));
     d->listen_addr.sin_family = AF_INET;
@@ -1065,6 +1047,8 @@ int main(int argc, char **argv) {
                 cilkVPN__read2(d);
             }
         }
+		
+		//timers
     }
 #elif defined(__APPLE__) || defined(__FreeBSD__)
     struct kevent events[MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT];
@@ -1079,6 +1063,8 @@ int main(int argc, char **argv) {
                 cilkVPN__read2(d);
             }
         }
+		
+		//timers
     }
 #endif
     
