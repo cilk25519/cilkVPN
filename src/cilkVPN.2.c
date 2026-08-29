@@ -100,7 +100,6 @@ sudo ifconfig utun5 up
 #define CILK_VPN_HANDSHAKE (CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES + crypto_box_PUBLICKEYBYTES + crypto_onetimeauth_BYTES + crypto_sign_BYTES + CILK_VPN_HANDSHAKE_TO_SIGN) //1+24+32+16+64+42=179
 #define CILK_VPN_STATIC_HANDSHAKE_PAYLOAD (crypto_sign_PUBLICKEYBYTES + CILK_VPN_HANDSHAKE_TO_SIGN_IP + CILK_VPN_HANDSHAKE_TO_SIGN_PORT)
 #define CILK_VPN_DATAGRAM (CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES + CILK_VPN_PEER_INDEX + crypto_onetimeauth_BYTES) //1+24+4+16=45
-#define CILK_VPN_PERSISTENT_KEEPALIVE_SECONDS_DEFAULT 20
 #define CILK_VPN_MAX_ALLOWED_IPS 256
 #define CILK_VPN_UDP_BUFFER_SIZE 65535
 #define CILK_VPN_TUN_BUFFER_SIZE (crypto_box_ZEROBYTES + 65535 - CILK_VPN_DATAGRAM)
@@ -112,7 +111,6 @@ sudo ifconfig utun5 up
 #define CILK_VPN_IFACE_OFFSET 4
 #endif
 #define MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT 1024
-#define MAX_PACKETS_PER_ONE_EVENT_LOOP_EVENT 64
 #define MAX_CONF_LINE_LENGTH 512
 #define MAX_CONF_KEY_LENGTH 64
 #define MAX_CONF_VALUE_LENGTH 256
@@ -181,39 +179,6 @@ typedef struct device_t {
     unsigned char inbound_handshake_key[crypto_box_BEFORENMBYTES];
     unsigned char inbound_handshake_to_sign[CILK_VPN_HANDSHAKE_TO_SIGN];
 } device;
-
-void ip_to_string(uint32_t ip, char *buffer, size_t buffer_size) {
-    struct in_addr addr;
-    addr.s_addr = ip;
-    inet_ntop(AF_INET, &addr, buffer, buffer_size);
-}
-
-int mask_to_cidr(uint32_t mask) {
-    // Преобразуем из сетевого порядка в хостовый для подсчета
-    uint32_t host_mask = ntohl(mask);
-    
-    // Подсчет количества единичных бит
-    int cidr = 0;
-    for (int i = 0; i < 32; i++) {
-        if (host_mask & (1 << (31 - i))) {
-            cidr++;
-        } else {
-            break; // Прерываемся при первом нулевом бите (для корректной маски)
-        }
-    }
-    
-    // Проверка, что маска корректна (все единицы идут подряд)
-    uint32_t expected_mask = 0;
-    if (cidr > 0) {
-        expected_mask = 0xFFFFFFFF << (32 - cidr);
-    }
-    
-    if (host_mask != expected_mask) {
-        return -1; // Неверный формат маски
-    }
-    
-    return cidr;
-}
 
 void update_peer_endpoint(peer *p, struct sockaddr_in peer_addr) {
     p->endpoint_addr.sin_addr.s_addr = peer_addr.sin_addr.s_addr;
@@ -411,17 +376,7 @@ void handle_datagram(device* d) {
 
 void cilkVPN__recv(device* d) {
     d->inbound_nrecv = recvfrom(d->udp, d->inbound_encrypted, CILK_VPN_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->peer_addr, &d->peer_addr_len);
-    
-    if (d->inbound_nrecv < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return;
-        }
-    
-        //log
-        return;
-    }
-    
-    if (d->inbound_nrecv == 0) {
+    if (d->inbound_nrecv <= 0) {
         return;
     }
     
@@ -436,17 +391,7 @@ void cilkVPN__recv(device* d) {
 
 void cilkVPN__read(device* d) {
     d->outbound_nread = read(d->iface, d->outbound_iface_datagram + crypto_box_ZEROBYTES, CILK_VPN_TUN_BUFFER_SIZE);
-    
-    if (d->outbound_nread < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return;
-        }
-    
-        //log
-        return;
-    }
-    
-    if (d->outbound_nread == 0) {
+    if (d->outbound_nread <= 0) {
         return;
     }
     
@@ -467,22 +412,17 @@ void cilkVPN__read(device* d) {
 }
 
 void cilkVPN__recv2(device* d) {
-	for (int i = 0; i < MAX_PACKETS_PER_ONE_EVENT_LOOP_EVENT; i++) {
+	while (1) {
 	    d->inbound_nrecv = recvfrom(d->udp, d->inbound_encrypted, CILK_VPN_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->peer_addr, &d->peer_addr_len);
+		if (d->inbound_nrecv == 0 || (d->inbound_nrecv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+			return;
+		}
 		
         if (d->inbound_nrecv < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
-            }
-
             //log
             return;
         }
 
-        if (d->inbound_nrecv == 0) {
-            return;
-        }
-	    
         if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_HANDSHAKE_BYTE) {
             handle_handshake(d);
         } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_DATAGRAM_BYTE) {
@@ -494,80 +434,14 @@ void cilkVPN__recv2(device* d) {
 }
 
 void cilkVPN__read2(device* d) {
-	for (int i = 0; i < MAX_PACKETS_PER_ONE_EVENT_LOOP_EVENT; i++) {
-		d->outbound_nread = read(d->iface, d->outbound_iface_datagram + crypto_box_ZEROBYTES, CILK_VPN_TUN_BUFFER_SIZE);
-		
-        if (d->outbound_nread < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
-            }
-
-            //log
-            return;
-        }
-
-        if (d->outbound_nread == 0) {
-            return;
-        }
-        
-        uint32_t ip_dst = *(uint32_t *)(d->outbound_iface_datagram + crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET + 16);
-        
-        peer* p = find_peer_by_allowed_ip(d->peers, ip_dst);
-        if (p == NULL) {
-            return;
-        }
-        
-        if (p->outbound_peer_ix == 0) {
-            return;
-        }
-        
-        if (encrypt_and_send_datagram_2_peer(d, p) <= 0) {
-            //log
-        }
-	}
-}
-
-void cilkVPN__recv3(device* d) {
-	while (1) {
-	    d->inbound_nrecv = recvfrom(d->udp, d->inbound_encrypted, CILK_VPN_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->peer_addr, &d->peer_addr_len);
-		
-        if (d->inbound_nrecv < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
-            }
-
-            //log
-            return;
-        }
-
-        if (d->inbound_nrecv == 0) {
-            return;
-        }
-	    
-        if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_HANDSHAKE_BYTE) {
-            handle_handshake(d);
-        } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_DATAGRAM_BYTE) {
-            handle_datagram(d);
-        } else if (d->inbound_encrypted[0] == CILK_VPN_TRANSPORT_KEEPALIVE_BYTE) {
-            //handle_keepalive(d);
-        }
-	}
-}
-
-void cilkVPN__read3(device* d) {
 	while (1) {
 		d->outbound_nread = read(d->iface, d->outbound_iface_datagram + crypto_box_ZEROBYTES, CILK_VPN_TUN_BUFFER_SIZE);
-		
-        if (d->outbound_nread < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
-            }
-
-            //log
+        if (d->outbound_nread == 0 || (d->outbound_nread < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
             return;
         }
-
-        if (d->outbound_nread == 0) {
+		
+        if (d->outbound_nread < 0) {
+            //log
             return;
         }
         
@@ -993,7 +867,6 @@ int init_device_from_file(device* d, FILE* f) {
             
             peer* p = malloc(sizeof(peer));
             memset(p, 0, sizeof(peer));
-            p->persistent_keepalive = CILK_VPN_PERSISTENT_KEEPALIVE_SECONDS_DEFAULT;
             
             if (last_peer == NULL) {
                 d->peers = last_peer = p;
@@ -1056,10 +929,6 @@ int init_device_from_file(device* d, FILE* f) {
             
             if (strcmp(key, "PersistentKeepalive") == 0) {
                 last_peer->persistent_keepalive = atoi(value);
-                
-                if (last_peer->persistent_keepalive <= 0) {
-                    last_peer->persistent_keepalive = CILK_VPN_PERSISTENT_KEEPALIVE_SECONDS_DEFAULT;
-                }
             }
         }
     }
@@ -1191,9 +1060,9 @@ int main(int argc, char **argv) {
 
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.fd == d->udp) {
-                cilkVPN__recv3(d);
+                cilkVPN__recv2(d);
             } else if (events[i].data.fd == d->iface) {
-                cilkVPN__read3(d);
+                cilkVPN__read2(d);
             }
         }
     }
@@ -1205,9 +1074,9 @@ int main(int argc, char **argv) {
         
         for (int i = 0; i < nfds; i++) {
             if ((int)events[i].ident == d->udp) {
-                cilkVPN__recv3(d);
+                cilkVPN__recv2(d);
             } else if ((int)events[i].ident == d->iface) {
-                cilkVPN__read3(d);
+                cilkVPN__read2(d);
             }
         }
     }
