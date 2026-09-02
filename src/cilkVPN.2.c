@@ -335,7 +335,7 @@ void handle_datagram(device* d) {
         return;
     }
     
-    uint32_t ip_src = *(uint32_t *)(d->inbound_buf2 + crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET + 12);
+    uint32_t ip_src = *(uint32_t *)(d->inbound_buf2 + crypto_box_ZEROBYTES + 12);
     if (is_allowed_ips(p, ip_src) == -1) {
         return;
     }
