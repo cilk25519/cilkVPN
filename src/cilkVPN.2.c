@@ -381,7 +381,6 @@ void cilkVPN__read(device* d) {
     }
     
     uint32_t ip_dst = *(uint32_t *)(d->outbound_buf + crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET + 16);
-    
     peer* p = find_peer_by_allowed_ip(d->peers, ip_dst);
     if (p == NULL) {
         return;
@@ -431,7 +430,6 @@ void cilkVPN__read2(device* d) {
         }
         
         uint32_t ip_dst = *(uint32_t *)(d->outbound_buf + crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET + 16);
-        
         peer* p = find_peer_by_allowed_ip(d->peers, ip_dst);
         if (p == NULL) {
             return;
