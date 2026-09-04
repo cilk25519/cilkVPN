@@ -16,7 +16,6 @@ sudo ./cilkVPN
 sudo ip link set mtu 1400 dev cilk0
 sudo ip addr add 10.0.0.1/24 dev cilk0
 sudo ip link set dev cilk0 up
-sudo ip route add 10.0.0.0/24 dev cilk0 //Возможно тоже не обязательно
 ip a
 
 macOS:
@@ -39,6 +38,7 @@ curl --interface cilk0 --noproxy '*' http://10.0.0.2/
 #include <stdio.h>
 #include <string.h>
 #include <syslog.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #include <stdlib.h> // exit, etc.
 #include <fcntl.h>
@@ -64,7 +64,7 @@ int tun_open(char* devname) {
         perror("open /dev/net/tun");
         exit(1);
     }
-	
+    
     memset(&ifr, 0, sizeof(ifr));
     ifr.ifr_flags = IFF_TUN; // | IFF_NO_PI; Убирает 4 байта на linux, которые по идее к пакету не относятся и нужно проставлять
     strncpy(ifr.ifr_name, devname, IFNAMSIZ); // devname = "tun0" or "tun1", etc
@@ -131,6 +131,12 @@ int utun_open(char name[20]) {
 }
 #endif
 
+void ip_to_string(uint32_t ip, char *buffer, size_t buffer_size) {
+    struct in_addr addr;
+    addr.s_addr = ip;
+    inet_ntop(AF_INET, &addr, buffer, buffer_size);
+}
+
 int main(int argc, char **argv) {
 #if defined(__linux__)
     int iface = tun_open("cilk0");
@@ -145,26 +151,24 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Unable to establish UTUN descriptor - aborting\n");
         exit(1);
     }
-	
+    
     fprintf(stderr, "Utun interface [%s] is up...\n", name);
 #endif
 
+    unsigned char buffer[1400];
+    
     for (;;) {
-        unsigned char buffer[1400];
-        
         int nread  = read(iface, buffer, 1400);
-		
-		printf("Len: %d\n", nread);
-		
-        for (int i = 0; i< nread; i++) {
-            printf("%02x ", buffer[i]);
         
-            if ( i%16 == 15 ) {
-                printf("\n");
-            }
-        }
+        uint32_t ip_src = *(uint32_t *)(buffer + 4 + 12);        
+        char ip_src_str[INET_ADDRSTRLEN];
+        ip_to_string(ip_src, ip_src_str, sizeof(ip_src_str));
         
-        printf("\n");
+        uint32_t ip_dst = *(uint32_t *)(buffer + 4 + 16);
+        char ip_dst_str[INET_ADDRSTRLEN];
+        ip_to_string(ip_dst, ip_dst_str, sizeof(ip_dst_str));
+        
+        printf("Src: %s Dest: %s Len: %d\n", ip_src_str, ip_dst_str, nread);
     }
     
     return 0;
