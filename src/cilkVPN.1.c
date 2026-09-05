@@ -1,5 +1,5 @@
 /*
-Build: clang ./cilkVPN.1.c -O3 -o ./cilkVPN
+clang ./cilkVPN.1.c -O3 -o ./cilkVPN
 
 Linux:
 sudo ip tuntap add dev cilk0 mode tun  
@@ -157,7 +157,7 @@ int main(int argc, char **argv) {
 
     unsigned char buffer[1400];
     
-    for (;;) {
+    while (1) {
         int nread  = read(iface, buffer, 1400);
         
         uint32_t ip_src = *(uint32_t *)(buffer + 4 + 12);        

@@ -6,7 +6,6 @@ clang ./cilkVPN.2.c -O3 -o ./cilkVPN
 ListenPort = 3342
 PrivateKey = ff4cb24de001f7970abe632ac9eeda89452b71042b71ef8959978a49e534a7e4
 Address = 10.0.0.1/24
-MTU = 1400
 
 [Peer]
 PublicKey = e911c20b180ea9316e93f1e94e88269bdb0290cf24bed6f0fefb939350cfefad
@@ -28,7 +27,6 @@ sudo ./cilkVPN
 ListenPort = 3343
 PrivateKey = 9c5904a620c3ecfb88ff19c03f3d05ef709f66f7f0929fd9d3ddf373333012cf
 Address = 10.0.0.2/24
-MTU = 1400
 
 [Peer]
 PublicKey = eb119f5604eac33290f6d8a0dc0e52d82f17914995c4acc7a8211b2235a71fb1
@@ -36,19 +34,16 @@ Endpoint = 193.124.59.51:3342
 AllowedIPs = 10.0.0.0/24
 PersistentKeepalive = 25
 =================================
-sudo ip tuntap add dev cilk0 mode tun  
+sudo ./cilkVPN
 sudo ip addr add 10.0.0.2/24 dev cilk0
 sudo ip link set mtu 1400 dev cilk0
 sudo ip link set dev cilk0 up
-sudo ip route add 10.0.0.0/24 dev cilk0
-sudo ./cilkVPN
 
 ========== Peer 3 conf ==========
 [Interface]
 ListenPort = 3342
 PrivateKey = 1ce257003246bc455931281ed68adcc1dff03a12bc1e864d810f6e3d491a8966
 Address = 10.0.0.3/24
-MTU = 1400
 
 [Peer]
 PublicKey = eb119f5604eac33290f6d8a0dc0e52d82f17914995c4acc7a8211b2235a71fb1
@@ -76,6 +71,7 @@ sudo ifconfig utun5 up
 #include <signal.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <time.h>
 #if defined(__linux__)
 #include <linux/if.h>
 #include <linux/if_tun.h>
@@ -129,6 +125,11 @@ typedef struct ip_address_t {
     uint32_t mask;
 } ip_address;
 
+typedef struct keepalive_timer_t {
+    time_t last_sent;
+    uint32_t interval;
+} keepalive_timer;
+
 typedef struct peer_t {
     unsigned char ed25519_identity_public_key[crypto_sign_PUBLICKEYBYTES];
     unsigned char x25519_identity_public_key[crypto_box_PUBLICKEYBYTES];
@@ -143,6 +144,7 @@ typedef struct peer_t {
     uint32_t outbound_peer_ix;
     uint32_t inbound_peer_ix;
     int init_handshake;
+    keepalive_timer keepalive;
     struct peer_t* next;
 } peer;
 
@@ -165,11 +167,14 @@ typedef struct device_t {
     unsigned char outbound_hs_sig[CILK_VPN_HANDSHAKE_SIG];
     unsigned char outbound_hs[CILK_VPN_HANDSHAKE];
     
-	int outbound_nread;
+    unsigned char keepalive_buf[crypto_box_ZEROBYTES];
+    unsigned char keepalive_buf2[CILK_VPN_DATAGRAM];
+    
+    int outbound_nread;
     unsigned char outbound_buf[CILK_VPN_TUN_BUFFER_SIZE];
     unsigned char outbound_buf2[CILK_VPN_TUN_ENCRYPTED_BUFFER];
     unsigned char nonce[crypto_box_NONCEBYTES];
-	
+    
     int inbound_nrecv;
     unsigned char inbound_buf[CILK_VPN_UDP_BUFFER_SIZE];
     unsigned char inbound_buf2[CILK_VPN_UDP_BUFFER_SIZE];
@@ -246,6 +251,39 @@ uint32_t generate_unique_inbound_peer_index(peer* peers) {
     }
 }
 
+void init_keepalive_timer(keepalive_timer* timer, int interval, time_t last_sent) {
+    timer->last_sent = last_sent;
+    timer->interval = interval;
+}
+
+int should_send_keepalive(keepalive_timer* timer) {
+    if (timer->interval == 0) {
+        return 0;
+    }
+    
+    time_t now = time(NULL);
+    
+    return (now - timer->last_sent) >= timer->interval;
+}
+
+int fetch_timeout(device* d) {
+    peer* p = d->peers;
+    
+    int min = -1; //no active timers
+    
+    while (p) {
+        if (p->persistent_keepalive > 0) {
+            if (p->persistent_keepalive < min || min == -1) {
+                min = p->persistent_keepalive;
+            }
+        }
+        
+        p = p->next;
+    }
+    
+    return min;
+}
+
 int send_handshake_2_peer(device* d, peer* p) {
     p->inbound_peer_ix = generate_unique_inbound_peer_index(d->peers);
     memcpy(d->outbound_hs_to_sign + crypto_sign_PUBLICKEYBYTES, &p->inbound_peer_ix, CILK_VPN_PEER_INDEX);
@@ -256,11 +294,11 @@ int send_handshake_2_peer(device* d, peer* p) {
     
     unsigned char* nonce = d->outbound_hs + CILK_VPN_TRANSPORT_TYPE;
     randombytes(nonce, crypto_box_NONCEBYTES); //gen nonce
-	
+    
     unsigned char* box = d->outbound_hs + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES + crypto_box_BOXZEROBYTES; //skip 1 byte of transport header + 24 bytes of nonce + 16 zerobytes
     crypto_box_afternm(box, d->outbound_hs_sig, CILK_VPN_HANDSHAKE_SIG, nonce, p->outbound_key); //encrypt
     
-	d->outbound_hs[0] = CILK_VPN_TRANSPORT_HANDSHAKE_BYTE;
+    d->outbound_hs[0] = CILK_VPN_TRANSPORT_HANDSHAKE_BYTE;
     memcpy(d->outbound_hs + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES, d->x25519_ephemeral_keypair.public_key, crypto_box_PUBLICKEYBYTES); //replace 32 zero bytes on ephemeral public key
     return sendto(d->udp, d->outbound_hs, CILK_VPN_HANDSHAKE, 0, (struct sockaddr *)&p->endpoint_addr, sizeof(p->endpoint_addr));
 }
@@ -303,12 +341,14 @@ void handle_handshake(device* d) {
     } else {
         p->init_handshake = 0;
     }
+    
+    init_keepalive_timer(&p->keepalive, p->persistent_keepalive, time(NULL));
 }
 
 int encrypt_and_send_datagram_2_peer(device* d, peer* p) {
     randombytes(d->nonce, crypto_box_NONCEBYTES);
     memset(d->outbound_buf + CILK_VPN_IFACE_OFFSET, 0, crypto_box_ZEROBYTES);
-	int len = d->outbound_nread + crypto_box_ZEROBYTES - CILK_VPN_IFACE_OFFSET;
+    int len = d->outbound_nread + crypto_box_ZEROBYTES - CILK_VPN_IFACE_OFFSET;
     crypto_box_afternm(d->outbound_buf2 + CILK_VPN_OFFSET_TO_CRYPTOGRAPHY, d->outbound_buf + CILK_VPN_IFACE_OFFSET, len, d->nonce, p->outbound_key); //encrypt
     
     d->outbound_buf2[0] = CILK_VPN_TRANSPORT_DATAGRAM_BYTE;
@@ -318,8 +358,8 @@ int encrypt_and_send_datagram_2_peer(device* d, peer* p) {
 }
 
 void handle_datagram(device* d) {
-	uint32_t peer_ix = *(uint32_t *)(d->inbound_buf + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES);
-	
+    uint32_t peer_ix = *(uint32_t *)(d->inbound_buf + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES);
+    
     peer* p = find_peer_by_inbound_peer_index(d->peers, peer_ix);
     if (p == NULL) {
         return;
@@ -341,7 +381,7 @@ void handle_datagram(device* d) {
     }
     
     update_peer_endpoint(p, d->peer_addr);
-	
+    
 #if defined(__linux__)
     if (write(d->iface, d->inbound_buf2 + crypto_box_ZEROBYTES, inbound_len - crypto_box_ZEROBYTES) <= 0) {
         //log
@@ -352,11 +392,57 @@ void handle_datagram(device* d) {
     on_freeBSD[1] = 0;
     on_freeBSD[2] = 0;
     on_freeBSD[3] = 2;
-	
+    
     if (write(d->iface, on_freeBSD, inbound_len - crypto_box_ZEROBYTES + CILK_VPN_IFACE_OFFSET) <= 0) {
         //log
     }
 #endif
+}
+
+int encrypt_and_send_keepalive_2_peer(device* d, peer* p) {
+    randombytes(d->nonce, crypto_box_NONCEBYTES);
+    memset(d->keepalive_buf, 0, crypto_box_ZEROBYTES);
+    crypto_box_afternm(d->keepalive_buf2 + CILK_VPN_OFFSET_TO_CRYPTOGRAPHY, d->keepalive_buf, crypto_box_ZEROBYTES, d->nonce, p->outbound_key); //encrypt
+    
+    d->keepalive_buf2[0] = CILK_VPN_TRANSPORT_KEEPALIVE_BYTE;
+    memcpy(d->keepalive_buf2 + CILK_VPN_TRANSPORT_TYPE, d->nonce, crypto_box_NONCEBYTES);
+    memcpy(d->keepalive_buf2 + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES, &p->outbound_peer_ix, CILK_VPN_PEER_INDEX);
+    return sendto(d->udp, d->keepalive_buf2, CILK_VPN_DATAGRAM, 0, (struct sockaddr *)&p->endpoint_addr, sizeof(p->endpoint_addr));
+}
+
+void handle_keepalive(device* d) {    
+    uint32_t peer_ix = *(uint32_t *)(d->inbound_buf + CILK_VPN_TRANSPORT_TYPE + crypto_box_NONCEBYTES);
+    
+    peer* p = find_peer_by_inbound_peer_index(d->peers, peer_ix);
+    if (p == NULL) {
+        return;
+    }
+    
+    memcpy(d->nonce, d->inbound_buf + CILK_VPN_TRANSPORT_TYPE, crypto_box_NONCEBYTES);
+    
+    int inbound_len = d->inbound_nrecv - CILK_VPN_OFFSET_TO_CRYPTOGRAPHY;
+    unsigned char* box = d->inbound_buf + CILK_VPN_OFFSET_TO_CRYPTOGRAPHY;
+    memset(box, 0, crypto_box_BOXZEROBYTES);
+    
+    if (crypto_box_open_afternm(d->inbound_buf2, box, inbound_len, d->nonce, p->inbound_key) == -1) { //decrypt 
+        return;
+    }
+    
+    update_peer_endpoint(p, d->peer_addr);
+}
+
+void check_keepalive_timers(device* d) {
+    peer* p = d->peers;
+    
+    while (p) {
+        if (p->outbound_peer_ix != 0 && should_send_keepalive(&p->keepalive)) {
+            if (encrypt_and_send_keepalive_2_peer(d, p) > 0) {
+                p->keepalive.last_sent = time(NULL);
+            }
+        }
+
+        p = p->next;
+    }
 }
 
 void cilkVPN__recv(device* d) {
@@ -370,7 +456,7 @@ void cilkVPN__recv(device* d) {
     } else if (d->inbound_buf[0] == CILK_VPN_TRANSPORT_DATAGRAM_BYTE) {
         handle_datagram(d);
     } else if (d->inbound_buf[0] == CILK_VPN_TRANSPORT_KEEPALIVE_BYTE) {
-        //handle_keepalive(d);
+        handle_keepalive(d);
     }
 }
 
@@ -396,12 +482,12 @@ void cilkVPN__read(device* d) {
 }
 
 void cilkVPN__recv2(device* d) {
-	while (1) {
-	    d->inbound_nrecv = recvfrom(d->udp, d->inbound_buf, CILK_VPN_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->peer_addr, &d->peer_addr_len);
-		if (d->inbound_nrecv == 0 || (d->inbound_nrecv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
-			return;
-		}
-		
+    while (1) {
+        d->inbound_nrecv = recvfrom(d->udp, d->inbound_buf, CILK_VPN_UDP_BUFFER_SIZE, 0, (struct sockaddr *)&d->peer_addr, &d->peer_addr_len);
+        if (d->inbound_nrecv == 0 || (d->inbound_nrecv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+            return;
+        }
+        
         if (d->inbound_nrecv < 0) {
             //log
             return;
@@ -412,18 +498,18 @@ void cilkVPN__recv2(device* d) {
         } else if (d->inbound_buf[0] == CILK_VPN_TRANSPORT_DATAGRAM_BYTE) {
             handle_datagram(d);
         } else if (d->inbound_buf[0] == CILK_VPN_TRANSPORT_KEEPALIVE_BYTE) {
-            //handle_keepalive(d);
+            handle_keepalive(d);
         }
-	}
+    }
 }
 
 void cilkVPN__read2(device* d) {
-	while (1) {
-		d->outbound_nread = read(d->iface, d->outbound_buf + crypto_box_ZEROBYTES, CILK_VPN_TUN_BUFFER_SIZE);
+    while (1) {
+        d->outbound_nread = read(d->iface, d->outbound_buf + crypto_box_ZEROBYTES, CILK_VPN_TUN_BUFFER_SIZE);
         if (d->outbound_nread == 0 || (d->outbound_nread < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
             return;
         }
-		
+        
         if (d->outbound_nread < 0) {
             //log
             return;
@@ -442,7 +528,7 @@ void cilkVPN__read2(device* d) {
         if (encrypt_and_send_datagram_2_peer(d, p) <= 0) {
             //log
         }
-	}
+    }
 }
 
 int make_udp(const struct sockaddr* listen_addr, size_t listen_addr_len) {
@@ -983,7 +1069,7 @@ device* make_device_from_config(const char* config_file) {
     d->listen_addr.sin_port = htons(d->listen_port);
     
     d->peer_addr_len = sizeof(d->peer_addr);
-	        
+            
     return d;
 }
 
@@ -1006,7 +1092,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Unable to establish tun descriptor - aborting\n");
         exit(1);
     }
-	
+    
     d->el = make_epoll(d->iface, d->udp);
 #elif defined(__APPLE__) || defined(__FreeBSD__)
     char name[20] = { 0 };
@@ -1032,11 +1118,13 @@ int main(int argc, char **argv) {
         p = p->next;
     }
     
+    int timeout = fetch_timeout(d);
+    
 #if defined(__linux__)
     struct epoll_event events[MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT];
     
     while (1) {
-        int nfds = epoll_wait(d->el, events, MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT, -1);
+        int nfds = epoll_wait(d->el, events, MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT, timeout);
 
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.fd == d->udp) {
@@ -1045,14 +1133,16 @@ int main(int argc, char **argv) {
                 cilkVPN__read2(d);
             }
         }
-		
-		//timers
+        
+        check_keepalive_timers(d);
     }
 #elif defined(__APPLE__) || defined(__FreeBSD__)
     struct kevent events[MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT];
+    struct timespec timeout_timespec;
+    timeout_timespec.tv_sec = timeout;
     
     while (1) {
-        int nfds = kevent(d->el, NULL, 0, events, MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT, NULL);
+        int nfds = kevent(d->el, NULL, 0, events, MAX_EVENTS_PER_ONE_EVENT_POOL_WAIT, timeout == -1 ? NULL : &timeout_timespec);
         
         for (int i = 0; i < nfds; i++) {
             if ((int)events[i].ident == d->udp) {
@@ -1061,8 +1151,8 @@ int main(int argc, char **argv) {
                 cilkVPN__read2(d);
             }
         }
-		
-		//timers
+        
+        check_keepalive_timers(d);
     }
 #endif
     
