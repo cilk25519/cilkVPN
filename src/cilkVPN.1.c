@@ -21,7 +21,7 @@ ip a
 macOS:
 sudo ./cilkVPN
 sudo ifconfig utun5 inet 10.0.0.1/32 10.0.0.1 alias
-sudo ip route add 10.0.0.0/24 dev utun5 | или sudo route add -net 10.0.0.0/24 -interface utun5
+sudo route add -net 10.0.0.0/24 -interface utun5
 sudo ifconfig utun5 up
 ip a
 
