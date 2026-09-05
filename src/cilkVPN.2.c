@@ -399,7 +399,7 @@ void handle_datagram(device* d) {
 #endif
 }
 
-int encrypt_and_send_keepalive_2_peer(device* d, peer* p) {
+int send_keepalive_2_peer(device* d, peer* p) {
     randombytes(d->nonce, crypto_box_NONCEBYTES);
     memset(d->keepalive_buf, 0, crypto_box_ZEROBYTES);
     crypto_box_afternm(d->keepalive_buf2 + CILK_VPN_OFFSET_TO_CRYPTOGRAPHY, d->keepalive_buf, crypto_box_ZEROBYTES, d->nonce, p->outbound_key); //encrypt
@@ -436,7 +436,7 @@ void check_keepalive_timers(device* d) {
     
     while (p) {
         if (p->outbound_peer_ix != 0 && should_send_keepalive(&p->keepalive)) {
-            if (encrypt_and_send_keepalive_2_peer(d, p) > 0) {
+            if (send_keepalive_2_peer(d, p) > 0) {
                 p->keepalive.last_sent = time(NULL);
             }
         }
