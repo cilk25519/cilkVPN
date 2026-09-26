@@ -1,0 +1,359 @@
+#!/bin/bash
+# cilkVPN-q - quick script for cilkVPN
+
+NC='\033[0m' # No Color
+CYAN='\033[0;96m' 
+PURPLE='\033[0;35m' # PINK='\033[1;35m' | PURPLE='\033[0;35m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+
+VPN_BIN_PATH="./cilkVPN"
+INTERFACE_LINUX="cilk0"
+
+ip_to_int() {
+    local IFS=.; local a b c d
+    read -r a b c d <<< "$1"
+    echo $(( (a<<24) | (b<<16) | (c<<8) | d ))
+}
+
+int_to_ip() {
+    echo "$(( ($1>>24) & 255 )).$(( ($1>>16) & 255 )).$(( ($1>>8) & 255 )).$(( $1 & 255 ))"
+}
+
+fetch_network_addr() {
+    local addr=$1 ip mask prefix mask_int
+    ip="${addr%%/*}"
+    mask="${addr##*/}"
+
+    if [[ "$mask" =~ ^[0-9]+$ ]]; then
+        prefix=$mask
+        (( prefix == 0 )) && mask_int=0 || mask_int=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    else
+        mask_int=$(ip_to_int "$mask")
+        prefix=0
+        for (( i=31; i>=0; i-- )); do
+            (( (mask_int >> i) & 1 )) && ((prefix++)) || break
+        done
+    fi
+
+    echo "$(int_to_ip $(( $(ip_to_int "$ip") & mask_int )))/$prefix"
+}
+
+get_utun_interface() {
+    # Find the most recently created utun interface on macOS/FreeBSD
+    local utun_iface=$(ifconfig 2>/dev/null | grep -o 'utun[0-9]*' | sort -V | tail -n1)
+    
+    echo "$utun_iface"
+}
+
+find_config() {
+    local config_file="$1"
+    local found_file=""
+	
+    if [ -f "$config_file" ]; then
+        echo "$config_file"
+        return 0
+    fi
+	
+    if [ -f "/etc/cilkVPN/$config_file" ]; then
+	    echo "/etc/cilkVPN/$config_file"
+		return 0
+	fi
+
+    return 1
+}
+
+parse_config() {
+    local config_file="$1"
+    local section=""
+    local interface_addr=""
+    local interface_mtu=""
+    local postup_commands=()
+    local postdown_commands=()
+    local peer_public_keys=()
+    local peer_allowed_ips=()
+    local has_default_route=0
+    
+    # Check if config file exists
+    if [[ ! -f "$config_file" ]]; then
+        echo "Error: Config file '$config_file' not found" >&2
+        return 1
+    fi
+    
+    # Read config line by line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        
+        # Check for section headers
+        if [[ "$line" =~ ^[[:space:]]*\[(Interface|Peer)\][[:space:]]*$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+        
+        # Parse key-value pairs
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            
+            case "$section" in
+                "Interface")
+                    case "$key" in
+                        "Address") interface_addr="$value" ;;
+                        "MTU") interface_mtu="$value" ;;
+                        "PostUp") 
+                            # Only add non-empty values and skip interface name
+                            if [[ -n "$value" && "$value" != "cilk0" && "$value" != "%i" ]]; then
+                                postup_commands+=("$value")
+                            fi
+                            ;;
+                        "PostDown")
+                            # Only add non-empty values and skip interface name
+                            if [[ -n "$value" && "$value" != "cilk0" && "$value" != "%i" ]]; then
+                                postdown_commands+=("$value")
+                            fi
+                            ;;
+                    esac
+                    ;;
+                "Peer")
+                    case "$key" in
+                        "PublicKey") peer_public_keys+=("$value") ;;
+                        "AllowedIPs") 
+                            peer_allowed_ips+=("$value")
+                            # Check for default route
+                            if [[ "$value" == "0.0.0.0/0" ]]; then
+                                has_default_route=1
+                            fi
+                            ;;
+                    esac
+                    ;;
+            esac
+        fi
+    done < "$config_file"
+    
+    local network_addr=""
+	local ip_addr=""
+	
+    if [[ -n "$interface_addr" ]]; then
+	    ip_addr="${interface_addr%%/*}"
+		network_addr=$(fetch_network_addr "$interface_addr")
+    fi
+    
+    # Print parsed values in a format that can be sourced
+    echo "INTERFACE_ADDR='$interface_addr'"
+    echo "INTERFACE_MTU='$interface_mtu'"
+	echo "IP_ADDR='$ip_addr'"
+    echo "NETWORK_ADDR='$network_addr'"
+    echo "HAS_DEFAULT_ROUTE='$has_default_route'"
+    
+    # Print commands with proper escaping
+    printf "POSTUP_COMMANDS=("
+    for cmd in "${postup_commands[@]}"; do
+        printf "'%s' " "$cmd"
+    done
+    printf ")\n"
+    
+    printf "POSTDOWN_COMMANDS=("
+    for cmd in "${postdown_commands[@]}"; do
+        printf "'%s' " "$cmd"
+    done
+    printf ")\n"
+}
+
+execute_hooks() {
+	local hook_label="$1"
+    local interface_name="$2"
+    shift 2
+    local commands=("$@")
+    
+    for cmd in "${commands[@]}"; do
+        # Skip empty commands
+        [[ -z "$cmd" ]] && continue
+        
+        # Replace %i with interface name
+        cmd="${cmd//\%i/$interface_name}"
+        
+        # Split commands by semicolon and execute
+        IFS=';' read -ra cmds <<< "$cmd"
+        for subcmd in "${cmds[@]}"; do
+            # Trim whitespace
+            subcmd="$(echo "$subcmd" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            
+            # Skip empty commands
+            [[ -z "$subcmd" ]] && continue
+            
+            # Skip if it's just the interface name
+            if [[ "$subcmd" == "$interface_name" ]] || [[ "$subcmd" == "cilk0" ]]; then
+                echo -e "${YELLOW}Skipping: $subcmd (not a valid command)${NC}"
+                continue
+            fi
+            
+            echo -e "${CYAN}$hook_label: ${PURPLE}$subcmd${NC}"
+            eval "$subcmd" || echo -e "${RED}Warning: Command failed: $subcmd${NC}"
+        done
+    done
+}
+
+start_vpn() {
+    local config_file="$1"
+    
+	local parsed_output
+    parsed_output=$(parse_config "$config_file")
+    if [[ $? -ne 0 ]]; then
+	    echo -e "${RED}Error: Empty config${NC}"
+        exit 1
+    fi
+	
+	eval "$parsed_output"
+	
+    if [[ -z "$INTERFACE_ADDR" ]]; then
+        echo -e "${RED}Error: Address not found in config${NC}"
+        exit 1
+    fi
+    
+    if [[ -z "$INTERFACE_MTU" ]]; then
+        echo -e "${YELLOW}Warning: MTU not found, using default 1400${NC}"
+        INTERFACE_MTU="1400"
+    fi
+    
+    # Start cilkVPN in background with config
+    $VPN_BIN_PATH "$config_file" &
+    local vpn_pid=$!
+    if ! kill -0 $vpn_pid 2>/dev/null; then
+        echo -e "${RED}Error: cilkVPN failed to start${NC}"
+        exit 1
+    fi
+	echo -e "${NC}$VPN_BIN_PATH ${CYAN}$config_file ${NC}(Pid: ${PURPLE}$vpn_pid${NC})"
+	
+    local interface_name=""
+    case "$OSTYPE" in
+        linux*)
+            interface_name="$INTERFACE_LINUX"
+			
+            local count=0
+            while ! ip link show "$interface_name" &>/dev/null; do
+                sleep 0.5
+                ((count++))
+                if [[ $count -gt 20 ]]; then
+                    echo -e "${RED}Error: Interface $interface_name not created${NC}"
+                    exit 1
+                fi
+            done			
+            ;;
+        darwin*|freebsd*)
+            sleep 1
+            interface_name=$(get_utun_interface)
+			
+            if [[ -z "$interface_name" ]]; then
+                echo -e "${RED}Error: Could not find utun interface${NC}"
+                return 1
+            fi
+            ;;
+    esac
+	
+    case "$OSTYPE" in
+        linux*)            
+            echo -e "${CYAN}ip addr add ${PURPLE}$INTERFACE_ADDR ${CYAN}dev $interface_name${NC}"
+            ip addr add "$INTERFACE_ADDR" dev "$interface_name"
+            
+            echo -e "${CYAN}ip link set mtu ${PURPLE}$INTERFACE_MTU ${CYAN}dev $interface_name${NC}"
+            ip link set mtu "$INTERFACE_MTU" dev "$interface_name"
+            
+            echo -e "${CYAN}ip link set dev ${PURPLE}$interface_name ${CYAN}up${NC}"
+            ip link set dev "$interface_name" up	
+            ;;
+        darwin*|freebsd*)		
+            echo -e "${CYAN}ifconfig $interface_name inet $IP_ADDR/32 $IP_ADDR alias${NC}"
+            ifconfig "$interface_name" inet "$IP_ADDR"/32 "$IP_ADDR" alias
+            
+            echo -e "${CYAN}ifconfig $interface_name mtu ${PURPLE}$INTERFACE_MTU${NC}"
+            ifconfig "$interface_name" mtu "$INTERFACE_MTU"
+            
+			echo -e "${CYAN}route add -net $NETWORK_ADDR -interface $interface_name${NC}"
+			route add -net $NETWORK_ADDR -interface $interface_name
+			
+            echo -e "${CYAN}ifconfig ${PURPLE}$interface_name ${CYAN}up${NC}"
+            ifconfig "$interface_name" up
+            ;;			
+    esac
+	
+    if [[ ${#POSTUP_COMMANDS[@]} -gt 0 ]]; then
+        execute_hooks "PostUp" "$interface_name" "${POSTUP_COMMANDS[@]}"
+    fi
+}
+
+stop_vpn() {
+    local config_file="$1"
+	
+    local parsed_output
+    parsed_output=$(parse_config "$config_file")
+    if [[ $? -ne 0 ]]; then
+        return 1
+    fi
+    eval "$parsed_output"
+    
+    local vpn_pid=$(pgrep -f "$VPN_BIN_PATH.*$config_file" | head -1)
+    if [[ -z "$vpn_pid" ]]; then
+        echo -e "${YELLOW}Warning: cilkVPN process not found${NC}"
+    fi
+	
+    if [[ -n "$vpn_pid" ]]; then
+        echo -e "Down ./cilkVPN ${CYAN}$config_file ${NC}(Pid: ${PURPLE}$vpn_pid${NC})"
+        kill "$vpn_pid" 2>/dev/null || kill -9 "$vpn_pid" 2>/dev/null
+    fi	
+    
+    local interface_name=""
+    case "$OSTYPE" in
+        linux*)
+            interface_name="$INTERFACE_LINUX"
+            ;;
+        darwin*|freebsd*)
+            interface_name=$(get_utun_interface)
+			
+			# route del -net $NETWORK_ADDR -interface $interface_name
+            ;;
+    esac
+
+    if [[ ${#POSTDOWN_COMMANDS[@]} -gt 0 ]]; then
+        execute_hooks "PostDown" "$interface_name" "${POSTDOWN_COMMANDS[@]}"
+    fi
+    
+    return 0
+}
+
+main() {
+    if [[ $# -lt 2 ]]; then
+        echo -e "${YELLOW}Warning: Use $0 {up|down} config_file. Param config_file can be path to config (searched in absolute/relative path and /etc/cilkVPN/)${NC}"
+        exit 1
+    fi
+    
+    local action="$1"
+    local config_input="$2"
+	
+    config_file=$(find_config "$config_input")
+    find_config_status=$?
+    
+    if [ $find_config_status -eq 1 ]; then
+	    echo -e "${RED}Error: Config file '$config_input' not found${NC}"
+		exit 1
+    fi
+	
+    if [ ! -f "$VPN_BIN_PATH" ]; then
+        echo -e "${RED}Error: cilkVPN executable not found in current directory${NC}"
+        exit 1
+    fi
+	
+    case "$action" in
+         up)
+             start_vpn "$config_file"
+             ;;
+         down)
+             stop_vpn "$config_file"
+             ;;
+        *)
+            echo -e "${RED}Error: Unknown action '$action'${NC}. Use: $0 {up|down} config_file"
+            ;;
+    esac
+}
+
+main "$@"
